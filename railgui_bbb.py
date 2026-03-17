@@ -1,0 +1,3049 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Rail Track Geometry Inspection System
+Target  : BeagleBone Black Industrial | Ubuntu | 1024×600 HDMI/Touch
+Stack   : PyQt5 | Python 3.8+
+Version : 4.0.0 — touch + mouse, all features working
+
+Sensor map:
+  Rotary Encoder   → eQEP → /sys/…/eqep/counter/count0/count
+  Gauge Pot(TRS100)→ ADC  → /sys/bus/iio/devices/iio:device0/in_voltage0_raw
+  Inclinometer     → SPI  → /dev/spidev1.0  (Murata SCL3300)
+  GNSS             → UART → /dev/ttyS4      (u-blox NEO-M8P-2)
+  LTE              → ETH  → eth1            (cdc_ether)
+  Display          → HDMI → omapdrm / xrandr
+"""
+
+import sys, os, json, csv, time, random, subprocess
+from datetime import datetime
+from pathlib import Path
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QFrame, QStackedWidget, QScrollArea,
+    QFileDialog, QTextEdit, QSizePolicy, QDialog, QTableWidget,
+    QTableWidgetItem, QHeaderView,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QPoint, QRect, QSize
+from PyQt5.QtGui import (
+    QPainter, QColor, QPen, QFont, QBrush, QLinearGradient, QPainterPath,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PALETTE
+# ─────────────────────────────────────────────────────────────────────────────
+BG    = "#050505"
+CARD  = "#0c0c0c"
+NEON  = "#39FF14"
+CYAN  = "#00D4FF"
+AMBER = "#FFCC00"
+RED   = "#FF3131"
+MAGI  = "#CC44FF"
+
+W, H = 1024, 600          # target display
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GLOBAL STYLESHEET  (no conflicting min-height; sizes set in code)
+# ─────────────────────────────────────────────────────────────────────────────
+SS = """
+QWidget            { background: #050505; color: #CCCCCC;
+                     font-family: 'Courier New', monospace; }
+QDialog            { background: #0e0e0e; }
+QFrame#Card        { background: #0c0c0c; border: 1px solid #1c1c1c;
+                     border-radius: 10px; }
+QFrame#Panel       { background: #080808; border: 1px solid #181818;
+                     border-radius: 8px; }
+QTextEdit          { background: #060606; border: 1px solid #1a1a1a;
+                     color: #888; font-size: 8pt; font-family: 'Courier New'; }
+QScrollBar:vertical          { background: #0a0a0a; width: 8px; }
+QScrollBar::handle:vertical  { background: #2a2a2a; border-radius: 4px;
+                                min-height: 30px; }
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical { height: 0; }
+
+/* ── named button styles ── */
+QPushButton#BG  { background:#002800; border:2px solid #39FF14; border-radius:7px;
+                  color:#39FF14; font-size:10pt; font-weight:bold; }
+QPushButton#BG:pressed   { background:#003d00; }
+QPushButton#BG:disabled  { background:#0a0a0a; border-color:#1a1a1a; color:#2a2a2a; }
+
+QPushButton#BC  { background:#001520; border:2px solid #00D4FF; border-radius:7px;
+                  color:#00D4FF; font-size:10pt; font-weight:bold; }
+QPushButton#BC:pressed   { background:#002030; }
+QPushButton#BC:disabled  { background:#0a0a0a; border-color:#1a1a1a; color:#2a2a2a; }
+
+QPushButton#BA  { background:#1a1200; border:2px solid #FFCC00; border-radius:7px;
+                  color:#FFCC00; font-size:10pt; font-weight:bold; }
+QPushButton#BA:pressed   { background:#261b00; }
+
+QPushButton#BR  { background:#1a0000; border:2px solid #FF3131; border-radius:7px;
+                  color:#FF3131; font-size:10pt; font-weight:bold; }
+QPushButton#BR:pressed   { background:#260000; }
+
+QPushButton#BM  { background:#140020; border:2px solid #CC44FF; border-radius:7px;
+                  color:#CC44FF; font-size:10pt; font-weight:bold; }
+QPushButton#BM:pressed   { background:#1e0030; }
+
+QPushButton#BX  { background:#111; border:1px solid #333; border-radius:7px;
+                  color:#666; font-size:10pt; font-weight:bold; }
+QPushButton#BX:pressed   { background:#1a1a1a; }
+
+/* numpad */
+QPushButton#NK  { background:#111; border:1px solid #2a2a2a; border-radius:8px;
+                  color:#DDD; font-size:18pt; font-weight:bold; }
+QPushButton#NK:pressed   { background:#222; border-color:#00D4FF; }
+QPushButton#NO  { background:#001520; border:1px solid #00D4FF; border-radius:8px;
+                  color:#00D4FF; font-size:14pt; font-weight:bold; }
+QPushButton#NO:pressed   { background:#002030; }
+QPushButton#NOK { background:#002800; border:2px solid #39FF14; border-radius:8px;
+                  color:#39FF14; font-size:14pt; font-weight:bold; }
+QPushButton#NOK:pressed  { background:#003d00; }
+QPushButton#ND  { background:#1a0a00; border:1px solid #FF8800; border-radius:8px;
+                  color:#FF8800; font-size:14pt; font-weight:bold; }
+QPushButton#ND:pressed   { background:#260e00; }
+
+/* char-key */
+QPushButton#CK  { background:#111; border:1px solid #2a2a2a; border-radius:5px;
+                  color:#aaa; font-size:11pt; font-weight:bold; }
+QPushButton#CK:pressed   { background:#222; border-color:#FFCC00; }
+
+/* entry-field row button */
+QPushButton#EF  { background:#0a0a0a; border:1px solid #222; border-radius:6px;
+                  color:#00D4FF; font-size:12pt; font-family:'Courier New';
+                  text-align:left; padding-left:12px; }
+QPushButton#EF:pressed   { background:#101018; border-color:#00D4FF; }
+
+/* sensor-list side button */
+QPushButton#SB  { background:#0c0c0c; border:1px solid #1e1e1e; border-radius:8px;
+                  color:#555; font-size:8pt; font-weight:bold;
+                  padding:6px 8px; text-align:left; }
+QPushButton#SB:checked { border-color:#39FF1466; color:#39FF14; }
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+CFG_PATH  = Path(__file__).parent / "rail_config.json"
+_DEF = {
+    "csv_dir":   str(Path.home() / "surveys"),
+    "hl_sec":    30,
+    "server":    "8.8.8.8",
+    "lte_iface": "eth1",
+    "encoder":   {"scale": 1.0,  "calibrated": False},
+    "adc":       {"zero": 2048,  "mpc": 0.0684, "calibrated": False},
+    "incl":      {"offset": 0.0, "calibrated": False},
+    "gnss":      {"ref_ch": 0.0, "calibrated": False},
+}
+
+
+def load_cfg():
+    if CFG_PATH.exists():
+        try:
+            d = json.loads(CFG_PATH.read_text())
+            for k, v in _DEF.items():
+                d.setdefault(k, v)
+                if isinstance(v, dict):
+                    for kk, vv in v.items():
+                        d[k].setdefault(kk, vv)
+            return d
+        except Exception:
+            pass
+    return {k: (dict(v) if isinstance(v, dict) else v) for k, v in _DEF.items()}
+
+
+def save_cfg(cfg):
+    try:
+        CFG_PATH.write_text(json.dumps(cfg, indent=2))
+    except Exception as e:
+        print(f"[CFG] {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HARDWARE
+# ─────────────────────────────────────────────────────────────────────────────
+# ── BeagleBone Black — Direct wiring, no breadboard, no external supply ──────
+#
+# POWER (from BBB onboard — no external supply needed):
+#   P9.32  VDD_ADC  1.8V  →  ALL three pot VCC legs (twist 3 wires into one pin)
+#   P9.34  GNDA_ADC       →  Pot 1 GND  (analog ground — best for ADC accuracy)
+#   P9.1   DGND           →  Pot 2 GND  (digital ground, fine for prototype)
+#   P9.2   DGND           →  Pot 3 GND  (digital ground, fine for prototype)
+#
+# SIGNAL (each wiper its own dedicated AIN pin — zero conflicts):
+#   P9.39  AIN0  →  Pot 1 wiper  (NovotechnikTRS-0100 — gauge)
+#   P9.40  AIN1  →  Pot 2 wiper  (Murata SCL3300-D01  — cross-level)
+#   P9.37  AIN2  →  Pot 3 wiper  (Chainage pot        — distance)
+#
+# STEP 2 — Rotary encoder upgrade (zero conflict with above, different header):
+#   P8.12  eQEP2A  →  Encoder A phase
+#   P8.11  eQEP2B  →  Encoder B phase
+#   P9.3   3.3V    →  Encoder VCC  (digital rail, separate from ADC P9.32)
+#   P9.1   DGND    →  Encoder GND
+#
+# BBB ADC: 12-bit (0–4095), max input 1.8V — do NOT exceed P9.32 voltage
+
+EQEP_PATH  = ("/sys/devices/platform/ocp/48304000.epwmss"
+              "/48304180.eqep/counter/count0/count")  # Step 2: encoder
+
+ADC_PATH   = "/sys/bus/iio/devices/iio:device0/in_voltage0_raw"  # AIN0 P9.39 — TRS100 gauge
+ADC_PATH_1 = "/sys/bus/iio/devices/iio:device0/in_voltage1_raw"  # AIN1 P9.40 — SCL3300 inclinometer
+ADC_PATH_2 = "/sys/bus/iio/devices/iio:device0/in_voltage2_raw"  # AIN2 P9.37 — chainage pot
+
+SPI_DEV    = "/dev/spidev1.0"
+
+# HW mode: True when BBB IIO ADC sysfs node is present (pots wired and BBB booted)
+HW_SIM     = not os.path.exists(ADC_PATH)
+
+
+def _sysfs(path, default="0"):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _lbl(text, color="#888", pt=9, bold=False):
+    l = QLabel(text)
+    w = "bold" if bold else "normal"
+    l.setStyleSheet(f"color:{color}; font-size:{pt}pt; font-weight:{w};")
+    l.setWordWrap(True)
+    return l
+
+
+def _logbox(h=90):
+    t = QTextEdit()
+    t.setReadOnly(True)
+    t.setFixedHeight(h)
+    return t
+
+
+def _vline():
+    f = QFrame()
+    f.setFrameShape(QFrame.VLine)
+    f.setStyleSheet("color:#1a1a1a; max-width:1px;")
+    return f
+
+
+def _btn(label, name, h=48, w=None):
+    b = QPushButton(label)
+    b.setObjectName(name)
+    b.setFixedHeight(h)
+    if w:
+        b.setFixedWidth(w)
+    return b
+
+
+def _shorten(path, n=34):
+    return ("…" + path[-(n - 1):]) if len(path) > n else path
+
+
+def _run_cmd(cmd, callback, parent):
+    """Fire-and-forget QProcess; callback(output_str) called on finish."""
+    proc = QProcess(parent)
+    proc.setProcessChannelMode(QProcess.MergedChannels)
+
+    def _done():
+        out = proc.readAllStandardOutput().data().decode(errors="replace")
+        callback(out)
+
+    proc.finished.connect(_done)
+    proc.start("sh", ["-c", cmd])
+    return proc     # keep reference alive on caller
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  NUMPAD DIALOG
+#  — plain QDialog (no frameless), styled dark; always fits inside 1024×600
+# ═════════════════════════════════════════════════════════════════════════════
+class NumpadDialog(QDialog):
+    def __init__(self, title, current_val="0", decimals=1,
+                 min_val=None, max_val=None, unit="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setStyleSheet(SS + "QDialog{background:#0e0e0e;}")
+        self.setFixedSize(380, 480)
+
+        self._dec  = decimals
+        self._min  = min_val
+        self._max  = max_val
+        self._unit = unit
+        self._buf  = str(current_val).strip()
+        self._result = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        # title
+        t = QLabel(title.upper())
+        t.setAlignment(Qt.AlignCenter)
+        t.setStyleSheet(
+            f"color:{CYAN}; font-size:11pt; font-weight:bold; letter-spacing:2px;"
+        )
+        root.addWidget(t)
+
+        # display
+        self._disp = QLabel()
+        self._disp.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._disp.setFixedHeight(58)
+        self._disp.setStyleSheet(
+            f"background:#060606; border:1px solid {CYAN}55; border-radius:6px;"
+            f" color:{CYAN}; font-size:24pt; font-family:'Courier New';"
+            f" padding-right:10px; font-weight:bold;"
+        )
+        root.addWidget(self._disp)
+
+        # numpad
+        g = QGridLayout()
+        g.setSpacing(6)
+        rows = [("7","8","9"), ("4","5","6"), ("1","2","3"), (".","0","⌫")]
+        for r, trio in enumerate(rows):
+            for c, lbl in enumerate(trio):
+                if lbl == "⌫":
+                    b = _btn(lbl, "ND", 64, 86)
+                    b.clicked.connect(self._del)
+                elif lbl == ".":
+                    b = _btn(lbl, "NO", 64, 86)
+                    b.clicked.connect(lambda _, ch=lbl: self._press(ch))
+                    b.setEnabled(decimals > 0)
+                else:
+                    b = _btn(lbl, "NK", 64, 86)
+                    b.clicked.connect(lambda _, ch=lbl: self._press(ch))
+                g.addWidget(b, r, c)
+
+        pm  = _btn("±",   "NO",  64, 86); pm.clicked.connect(self._sign);  g.addWidget(pm,  4, 0)
+        clr = _btn("CLR", "NO",  64, 86); clr.clicked.connect(self._clear); g.addWidget(clr, 4, 1)
+        ok  = _btn("✓ OK","NOK", 64, 86); ok.clicked.connect(self._confirm); g.addWidget(ok,  4, 2)
+        root.addLayout(g)
+
+        cnc = _btn("✕  CANCEL", "BR", 46)
+        cnc.clicked.connect(self.reject)
+        root.addWidget(cnc)
+        self._refresh()
+
+        # Centre over parent
+        if parent:
+            pg = parent.geometry()
+            self.move(pg.x() + (pg.width()  - self.width())  // 2,
+                      pg.y() + (pg.height() - self.height()) // 2)
+
+    # ── numpad logic ──────────────────────────────────────────────────────────
+    def _press(self, ch):
+        if ch == "." and "." in self._buf:
+            return
+        if "." in self._buf and ch != ".":
+            after_dot = self._buf.split(".")[1]
+            if len(after_dot) >= self._dec:
+                return
+        stripped = self._buf.lstrip("-")
+        if stripped in ("0", "") and ch != ".":
+            self._buf = ("-" if self._buf.startswith("-") else "") + ch
+        else:
+            self._buf += ch
+        self._refresh()
+
+    def _del(self):
+        self._buf = self._buf[:-1] if len(self._buf) > 1 else "0"
+        if self._buf == "-":
+            self._buf = "0"
+        self._refresh()
+
+    def _clear(self):
+        self._buf = "0"
+        self._refresh()
+
+    def _sign(self):
+        if self._buf.startswith("-"):
+            self._buf = self._buf[1:]
+        elif self._buf not in ("0", ""):
+            self._buf = "-" + self._buf
+        self._refresh()
+
+    def _refresh(self):
+        suf = f"  {self._unit}" if self._unit else ""
+        self._disp.setText((self._buf or "0") + suf)
+
+    def _confirm(self):
+        try:
+            v = float(self._buf)
+        except ValueError:
+            v = 0.0
+        if self._min is not None:
+            v = max(float(self._min), v)
+        if self._max is not None:
+            v = min(float(self._max), v)
+        self._result = v
+        self.accept()
+
+    def get_value(self):
+        return self._result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TEXT PICKER DIALOG
+#  — preset tiles + compact A-Z keyboard; fits within 600px height
+# ═════════════════════════════════════════════════════════════════════════════
+class TextPickerDialog(QDialog):
+    def __init__(self, title, presets=None, current="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setStyleSheet(SS + "QDialog{background:#0e0e0e;}")
+        self.setFixedSize(680, 560)
+
+        self._buf    = current or ""
+        self._result = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(6)
+
+        # title + display on same row to save vertical space
+        hdr = QHBoxLayout()
+        t = QLabel(title.upper())
+        t.setStyleSheet(
+            f"color:{AMBER}; font-size:11pt; font-weight:bold; letter-spacing:2px;"
+        )
+        self._disp = QLabel(self._buf or "—")
+        self._disp.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._disp.setFixedHeight(44)
+        self._disp.setMinimumWidth(260)
+        self._disp.setStyleSheet(
+            f"background:#060606; border:1px solid {AMBER}55; border-radius:5px;"
+            f" color:{AMBER}; font-size:16pt; font-family:'Courier New';"
+            f" padding-right:8px; font-weight:bold;"
+        )
+        hdr.addWidget(t, 0)
+        hdr.addStretch()
+        hdr.addWidget(self._disp, 1)
+        root.addLayout(hdr)
+
+        # preset buttons grid (3 per row, fixed height 44)
+        if presets:
+            pg = QGridLayout()
+            pg.setSpacing(5)
+            per_row = 4
+            for i, p in enumerate(presets):
+                b = QPushButton(p)
+                b.setObjectName("BA")
+                b.setFixedHeight(44)
+                b.clicked.connect(lambda _, v=p: self._pick(v))
+                pg.addWidget(b, i // per_row, i % per_row)
+            root.addLayout(pg)
+
+        # compact keyboard: rows of 10 chars each
+        kb_rows = ["ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ0123", "456789/-. "]
+        for row_str in kb_rows:
+            rl = QHBoxLayout()
+            rl.setSpacing(3)
+            for ch in row_str:
+                label = "SPC" if ch == " " else ch
+                b = QPushButton(label)
+                b.setObjectName("CK")
+                b.setFixedSize(58, 42)
+                b.clicked.connect(lambda _, c=ch: self._char(c))
+                rl.addWidget(b)
+            root.addLayout(rl)
+
+        # backspace + clear
+        br = QHBoxLayout()
+        br.setSpacing(6)
+        bs  = _btn("⌫  BACK", "ND",  42); bs.clicked.connect(self._bksp)
+        clr = _btn("CLR",     "BX",  42); clr.clicked.connect(self._clr)
+        br.addWidget(bs, 1)
+        br.addWidget(clr, 1)
+        root.addLayout(br)
+
+        # ok / cancel
+        bot = QHBoxLayout()
+        bot.setSpacing(8)
+        ok  = _btn("✓  CONFIRM", "BG", 46); ok.clicked.connect(self._confirm)
+        cnc = _btn("✕  CANCEL",  "BR", 46); cnc.clicked.connect(self.reject)
+        bot.addWidget(cnc, 1)
+        bot.addWidget(ok,  1)
+        root.addLayout(bot)
+
+        if parent:
+            pg = parent.geometry()
+            self.move(pg.x() + (pg.width()  - self.width())  // 2,
+                      pg.y() + (pg.height() - self.height()) // 2)
+
+    def _pick(self, v):
+        self._buf = v
+        self._disp.setText(v or "—")
+
+    def _char(self, ch):
+        self._buf += ch
+        self._disp.setText(self._buf or "—")
+
+    def _bksp(self):
+        self._buf = self._buf[:-1]
+        self._disp.setText(self._buf or "—")
+
+    def _clr(self):
+        self._buf = ""
+        self._disp.setText("—")
+
+    def _confirm(self):
+        self._result = self._buf
+        self.accept()
+
+    def get_value(self):
+        return self._result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  REUSABLE TOUCH STEPPER  (no conflicting stylesheet sizing)
+# ═════════════════════════════════════════════════════════════════════════════
+class Stepper(QWidget):
+    """  −  [ value ]  +   tap value to open numpad  """
+    changed = pyqtSignal(float)
+
+    def __init__(self, val=0, step=1, dec=0,
+                 lo=0, hi=9999, unit="", title="VALUE", parent=None):
+        super().__init__(parent)
+        self._step = step
+        self._dec  = dec
+        self._lo   = lo
+        self._hi   = hi
+        self._unit = unit
+        self._title = title
+        self._val  = float(val)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self._minus = QPushButton("−")
+        self._minus.setObjectName("BX")
+        self._minus.setFixedSize(46, 46)
+        self._minus.clicked.connect(self._dec_v)
+
+        self._btn = QPushButton()
+        self._btn.setObjectName("BC")
+        self._btn.setFixedHeight(46)
+        self._btn.clicked.connect(self._open_pad)
+
+        self._plus = QPushButton("+")
+        self._plus.setObjectName("BC")
+        self._plus.setFixedSize(46, 46)
+        self._plus.clicked.connect(self._inc_v)
+
+        lay.addWidget(self._minus)
+        lay.addWidget(self._btn, 1)
+        lay.addWidget(self._plus)
+        self._refresh()
+
+    def _refresh(self):
+        suf = f"  {self._unit}" if self._unit else ""
+        self._btn.setText(f"{self._val:.{self._dec}f}{suf}")
+
+    def _dec_v(self):
+        self._val = max(self._lo, round(self._val - self._step, self._dec))
+        self._refresh()
+        self.changed.emit(self._val)
+
+    def _inc_v(self):
+        self._val = min(self._hi, round(self._val + self._step, self._dec))
+        self._refresh()
+        self.changed.emit(self._val)
+
+    def _open_pad(self):
+        dlg = NumpadDialog(
+            self._title,
+            f"{self._val:.{self._dec}f}",
+            decimals=self._dec,
+            min_val=self._lo, max_val=self._hi,
+            unit=self._unit,
+            parent=self.window(),
+        )
+        if dlg.exec_() == QDialog.Accepted and dlg.get_value() is not None:
+            self._val = dlg.get_value()
+            self._refresh()
+            self.changed.emit(self._val)
+
+    def value(self):
+        return self._val
+
+    def set_value(self, v):
+        self._val = float(v)
+        self._refresh()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PRESET TILES  (radio-style; all in code — no CSS selector needed)
+# ═════════════════════════════════════════════════════════════════════════════
+class PresetTiles(QWidget):
+    changed = pyqtSignal(str)
+
+    def __init__(self, options, selected="", color=CYAN, parent=None):
+        super().__init__(parent)
+        self._color = color
+        self._btns  = {}
+        self._sel   = ""
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(5)
+
+        for opt in options:
+            b = QPushButton(opt)
+            b.setFixedHeight(44)
+            b.setMinimumWidth(60)
+            self._style(b, False)
+            b.clicked.connect(lambda _, v=opt: self._pick(v))
+            lay.addWidget(b)
+            self._btns[opt] = b
+
+        lay.addStretch()
+        target = selected if selected in self._btns else (options[0] if options else "")
+        if target:
+            self._pick(target)
+
+    def _style(self, btn, active):
+        c = self._color
+        if active:
+            btn.setStyleSheet(
+                f"QPushButton{{background:{c}22; border:2px solid {c};"
+                f" border-radius:5px; color:{c}; font-size:9pt;"
+                f" font-weight:bold; padding:0 10px;}}"
+                f"QPushButton:pressed{{background:{c}33;}}"
+            )
+        else:
+            btn.setStyleSheet(
+                "QPushButton{background:#111; border:1px solid #2a2a2a;"
+                " border-radius:5px; color:#444; font-size:9pt;"
+                " font-weight:bold; padding:0 10px;}"
+                "QPushButton:pressed{background:#1a1a1a;}"
+            )
+
+    def _pick(self, v):
+        for opt, btn in self._btns.items():
+            self._style(btn, opt == v)
+        self._sel = v
+        self.changed.emit(v)
+
+    def value(self):
+        return self._sel
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SENSOR THREAD  (Thread 1 — reads all three BBB ADC channels at 2 Hz)
+#
+#  Hardware path (HW_SIM = False, BBB ADC sysfs present):
+#    AIN0 P9.39  →  TRS100  pot  →  gauge mm
+#    AIN1 P9.40  →  SCL3300 pot  →  cross-level deg
+#    AIN2 P9.37  →  chainage pot →  distance m
+#
+#  Sensor emulation formulas (validated, all in-range):
+#    gauge    = 1435 + (raw0 − GAUGE_ZERO) × GAUGE_MPC          [mm]
+#    cross    = (raw1 − 2048) / 2048 × 30.0 − offset            [deg, ±30°]
+#    chainage = raw2 / 4095 × 10000                             [m, 0–10 km]
+#    twist    = |cross_now − cross_prev| / 3.0                  [mm/m, 3 m chord]
+#
+# ── STEP 2: Replace chainage pot with rotary encoder ─────────────────────────
+#  When the encoder is wired to P8.12 (eQEP2A) and P8.11 (eQEP2B):
+#    1. Uncomment the _hw_encoder() method below
+#    2. In _hw(), replace self._hw_chainage_pot() with self._hw_encoder()
+#    3. Set cfg["encoder"]["scale"] in the calibration page (mm/count)
+#    4. Encoder VCC → P9.3 (3.3V digital rail, separate from ADC supply)
+# ═════════════════════════════════════════════════════════════════════════════
+class SensorThread(QThread):
+    data_ready = pyqtSignal(dict)
+    fault      = pyqtSignal(str)
+    motion     = pyqtSignal(bool)
+
+    # Validated sensor constants
+    _ADC_MAX     = 4095    # BBB 12-bit ADC full scale
+    _ADC_MID     = 2048    # mid-point = standard gauge / level
+    _GAUGE_STD   = 1435.0  # standard gauge mm
+    _GAUGE_MPC   = 0.04883 # mm/ADC-count (±100 mm over 2048 counts)
+    _INCL_FS     = 30.0    # SCL3300-D01 Mode-1 ±30° full scale
+    _CHAIN_MAX   = 10000.0 # pot full-sweep distance (metres)
+    _TWIST_CHORD = 3.0     # railway standard 3 m twist chord
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg         = cfg
+        self.active      = False
+        self._prev_cross = 0.0
+        self._sim_dist   = 0.0
+        # self._lastc    = 0    # Step 2: uncomment when encoder replaces pot
+
+    def run(self):
+        while True:
+            if self.active:
+                try:
+                    d = self._sim() if HW_SIM else self._hw()
+                    self.data_ready.emit(d)
+                except Exception as e:
+                    self.fault.emit(str(e))
+            self.msleep(500)
+
+    # ── HARDWARE: reads all three ADC channels directly ───────────────────────
+    def _hw(self):
+        self.motion.emit(True)
+
+        # AIN0 P9.39 → TRS100 gauge pot
+        zero  = self.cfg["adc"].get("zero", self._ADC_MID)
+        mpc   = self.cfg["adc"].get("mpc",  self._GAUGE_MPC)
+        raw0  = int(_sysfs(ADC_PATH, str(zero)))
+        gauge = self._GAUGE_STD + (raw0 - zero) * mpc
+
+        # AIN1 P9.40 → SCL3300 inclinometer pot
+        raw1  = int(_sysfs(ADC_PATH_1, str(self._ADC_MID)))
+        cross = self._adc_to_cross(raw1)
+
+        # AIN2 P9.37 → chainage pot (replace with _hw_encoder() in Step 2)
+        dist  = self._hw_chainage_pot()
+
+        # Twist = |Δcross-level| / 3 m chord
+        twist = round(abs(cross - self._prev_cross) / self._TWIST_CHORD, 4)
+        self._prev_cross = cross
+
+        return {
+            "gauge": round(gauge, 2),
+            "cross": cross,
+            "twist": twist,
+            "dist":  dist,
+            "lat":   0.0,
+            "lon":   0.0,
+            "speed": 0.0,
+        }
+
+    def _adc_to_cross(self, raw):
+        """12-bit ADC → SCL3300-D01 cross-level degrees.
+        ADC=0 → -30°  |  ADC=2048 → 0°  |  ADC=4095 → +30°
+        Subtracts calibrated zero offset from cfg["incl"]["offset"]."""
+        offset = self.cfg["incl"].get("offset", 0.0)
+        return round((raw - self._ADC_MID) / self._ADC_MID * self._INCL_FS - offset, 4)
+
+    def _hw_chainage_pot(self):
+        """AIN2 P9.37 → chainage pot → distance in metres.
+        Full sweep 0–4095 maps to 0–10 000 m.
+        Replace this method with _hw_encoder() in Step 2."""
+        raw = int(_sysfs(ADC_PATH_2, "0"))
+        return round(raw / self._ADC_MAX * self._CHAIN_MAX, 2)
+
+    # ── STEP 2: uncomment when rotary encoder replaces chainage pot ───────────
+    # def _hw_encoder(self):
+    #     """eQEP2 rotary encoder on P8.12/P8.11 → distance in metres.
+    #     Wiring: P8.12 eQEP2A, P8.11 eQEP2B, P9.3 VCC (3.3V), P9.1 GND.
+    #     Zero conflict with ADC pins — different header (P8 vs P9 ADC cluster).
+    #     Steps:
+    #       1. Wire encoder to P8.11/P8.12 (no existing ADC pins used)
+    #       2. Uncomment this method
+    #       3. In _hw() change: dist = self._hw_chainage_pot()
+    #                       to: dist = self._hw_encoder()
+    #       4. Calibrate scale in settings → cfg["encoder"]["scale"] mm/count
+    #     """
+    #     cnt          = int(_sysfs(EQEP_PATH, "0"))
+    #     delta        = cnt - self._lastc
+    #     self._lastc  = cnt
+    #     dist_mm      = getattr(self, "_enc_dist_mm", 0.0) + delta * self.cfg["encoder"]["scale"]
+    #     self._enc_dist_mm = dist_mm
+    #     self.motion.emit(delta != 0)
+    #     return round(dist_mm / 1000.0, 2)
+
+    # ── SIMULATION: realistic synthetic data for development ─────────────────
+    def _sim(self):
+        import math
+        self._sim_dist  += 0.2
+        self.motion.emit(True)
+        t     = self._sim_dist * 0.1
+        gauge = round(self._GAUGE_STD + random.gauss(0, 0.12), 2)
+        cross = round(0.8 * math.sin(t) + random.gauss(0, 0.08), 4)
+        twist = round(max(0.0, abs(cross - self._prev_cross) / self._TWIST_CHORD
+                         + random.gauss(0, 0.01)), 4)
+        self._prev_cross = cross
+        return {
+            "gauge": gauge,
+            "cross": cross,
+            "twist": twist,
+            "dist":  round(self._sim_dist, 1),
+            "lat":   12.9716 + self._sim_dist * 1e-6,
+            "lon":   77.5946 + self._sim_dist * 1e-6,
+            "speed": round(random.uniform(2.0, 8.0), 1),
+        }
+
+    def reset(self):
+        self._prev_cross  = 0.0
+        self._sim_dist    = 0.0
+        # self._lastc     = 0    # Step 2: uncomment for encoder
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  NETWORK THREAD
+# ═════════════════════════════════════════════════════════════════════════════
+class NetThread(QThread):
+    status = pyqtSignal(int, bool)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+    def run(self):
+        while True:
+            self.status.emit(self._lte(), self._ping())
+            self.sleep(15)
+
+    def _lte(self):
+        iface = self.cfg.get("lte_iface", "eth1")
+        if _sysfs(f"/sys/class/net/{iface}/operstate", "down") == "up": return 3
+        if _sysfs("/sys/class/net/eth0/operstate",     "down") == "up": return 2
+        return 0 if not HW_SIM else 3
+
+    def _ping(self):
+        if HW_SIM: return True
+        try:
+            r = subprocess.run(
+                ["ping", "-c", "1", "-W", "2", self.cfg.get("server", "8.8.8.8")],
+                capture_output=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CSV LOGGER
+# ═════════════════════════════════════════════════════════════════════════════
+STATION_NAME = "BLR"
+
+_FIELDS = [
+    "epoch_time",
+    "reference_type",
+    "reference_value",
+    "latitude",
+    "longitude",
+    "cross_level",
+    "chainage",
+    "twist",
+    "tilt",
+    "tilt_cord_length",
+]
+
+
+class CSVLogger:
+    def __init__(self):
+        self._f              = self._w = None
+        self._rows           = []
+        self.path            = ""
+        self.count           = 0
+        self._ref_type       = ""
+        self._ref_value      = ""
+        self._station        = "BLE"
+
+    def set_reference(self, ref_type, ref_value):
+        """Call before starting a session to store reference type and value."""
+        self._ref_type  = ref_type
+        self._ref_value = ref_value
+
+    def set_station(self, station_name):
+        """Set station name used in the filename."""
+        self._station = station_name.strip() if station_name else "UNKNOWN"
+
+    def start(self, directory, hl_sec=30):
+        os.makedirs(directory, exist_ok=True)
+        # filename: BLE_yyyy-mm-dd_HH-MM-SS.csv
+        safe_ts  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"BLE_{safe_ts}.csv"
+        self.path = os.path.join(directory, filename)
+        self._f   = open(self.path, "w", newline="")
+        self._w   = csv.DictWriter(self._f, fieldnames=_FIELDS)
+        self._w.writeheader()
+        self._rows  = []
+        self._hl_s  = hl_sec
+        self.count  = 0
+
+    def write(self, d):
+        if not self._w: return
+        cross = d.get("cross", 0)
+        row = {
+            "epoch_time":       int(time.time()),
+            "reference_type":   self._ref_type,
+            "reference_value":  self._ref_value,
+            "latitude":         d.get("lat",   0),
+            "longitude":        d.get("lon",   0),
+            "cross_level":      cross,
+            "chainage":         d.get("dist",  0),
+            "twist":            d.get("twist", 0),
+            "tilt":             cross,              # tilt = inclinometer = cross level
+            "tilt_cord_length": d.get("dist",  0), # cord length tracks with chainage
+        }
+        self._rows.append((time.time(), row))
+        self._w.writerow(row)
+        self._f.flush()
+        self.count += 1
+
+    def mark(self, hl_sec=30):
+        if not self._w or not self._rows: return
+        self._hl_s = hl_sec
+        self._f.seek(0); self._f.truncate()
+        self._w.writeheader()
+        for ts, row in self._rows:
+            self._w.writerow(row)
+        self._f.flush()
+
+    def stop(self):
+        if self._f: self._f.close()
+        self._f = self._w = None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CSV WRITER THREAD  (Thread 2)
+#
+#  Fully independent of GUI and sensor threads.
+#  Uses a bounded queue — enqueue() is non-blocking and never stalls the GUI.
+#  Each survey session writes to a timestamped CSV in cfg["csv_dir"].
+#  Includes "gauge" column in addition to the standard _FIELDS for traceability.
+# ═════════════════════════════════════════════════════════════════════════════
+import queue as _queue
+
+
+class CSVWriterThread(QThread):
+    wrote = pyqtSignal(int)   # emits total row count after each write
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._q         = _queue.Queue(maxsize=2000)
+        self._f         = None
+        self._writer    = None
+        self.path       = ""
+        self.count      = 0
+        self._ref_type  = ""
+        self._ref_value = ""
+        self._station   = "BLE"
+
+    # ── Public API (safe to call from any thread) ─────────────────────────────
+    def set_reference(self, ref_type, ref_value):
+        self._ref_type  = ref_type
+        self._ref_value = ref_value
+
+    def set_station(self, name):
+        self._station = name.strip() if name else "UNKNOWN"
+
+    def start_session(self, directory, hl_sec=30):
+        """Open a new timestamped CSV file for this survey session."""
+        os.makedirs(directory, exist_ok=True)
+        ts        = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename  = f"{self._station}_{ts}.csv"
+        self.path = os.path.join(directory, filename)
+        self.count = 0
+        self._q.put({"_cmd": "open", "_path": self.path})
+
+    def stop_session(self):
+        """Flush remaining rows and close the current file."""
+        self._q.put({"_cmd": "close"})
+
+    def enqueue(self, d):
+        """Non-blocking push — silently drops if queue is full.
+        Never blocks the GUI or sensor thread."""
+        try:
+            self._q.put_nowait(d)
+        except _queue.Full:
+            pass
+
+    # ── Thread body ───────────────────────────────────────────────────────────
+    def run(self):
+        _EXTENDED = list(_FIELDS) + ["gauge"]
+        while True:
+            try:
+                item = self._q.get(timeout=1.0)
+            except _queue.Empty:
+                continue
+
+            if isinstance(item, dict) and "_cmd" in item:
+                cmd = item["_cmd"]
+                if cmd == "open":
+                    if self._f:
+                        self._f.flush(); self._f.close()
+                    self._f = open(item["_path"], "w", newline="", buffering=1)
+                    self._writer = csv.DictWriter(
+                        self._f, fieldnames=_EXTENDED, extrasaction="ignore")
+                    self._writer.writeheader()
+                    self._f.flush()
+                    self.count = 0
+                elif cmd in ("close", "stop"):
+                    if self._f:
+                        self._f.flush(); self._f.close()
+                        self._f = self._writer = None
+                    if cmd == "stop":
+                        break
+                continue
+
+            if self._writer is None:
+                continue
+            cross = item.get("cross", 0)
+            row = {
+                "epoch_time":       int(time.time()),
+                "reference_type":   self._ref_type,
+                "reference_value":  self._ref_value,
+                "latitude":         item.get("lat",   0),
+                "longitude":        item.get("lon",   0),
+                "cross_level":      cross,
+                "chainage":         item.get("dist",  0),
+                "twist":            item.get("twist", 0),
+                "tilt":             cross,
+                "tilt_cord_length": item.get("dist",  0),
+                "gauge":            item.get("gauge", 0),
+            }
+            try:
+                self._writer.writerow(row)
+                self._f.flush()
+                self.count += 1
+                self.wrote.emit(self.count)
+            except Exception as e:
+                print(f"[CSVWriterThread] write error: {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SPARKLINE
+# ═════════════════════════════════════════════════════════════════════════════
+class SparkLine(QWidget):
+    def __init__(self, color=NEON, parent=None):
+        super().__init__(parent)
+        self._d   = []
+        self._col = QColor(color)
+        self.setFixedHeight(24)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def push(self, v):
+        self._d.append(float(v))
+        if len(self._d) > 200: self._d.pop(0)
+        self.update()
+
+    def paintEvent(self, _):
+        if len(self._d) < 2: return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        mn, mx = min(self._d), max(self._d)
+        rng = mx - mn or 1
+        pts = [QPoint(int(W * i / (len(self._d) - 1)),
+                      int(H * (mx - v) / rng))
+               for i, v in enumerate(self._d)]
+        p.setPen(QPen(self._col, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        for i in range(len(pts) - 1):
+            p.drawLine(pts[i], pts[i + 1])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  GRAPH CANVAS  (QPainter only — no matplotlib)
+# ═════════════════════════════════════════════════════════════════════════════
+class GraphCanvas(QWidget):
+    def __init__(self, color=NEON, parent=None):
+        super().__init__(parent)
+        self._d   = []
+        self._col = QColor(color)
+        self.title = ""
+        self.unit  = ""
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def load(self, data, title="", unit=""):
+        self._d = list(data); self.title = title; self.unit = unit
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, QColor(BG))
+        if len(self._d) < 2:
+            p.setPen(QColor("#333"))
+            p.setFont(QFont("Courier New", 10))
+            p.drawText(QRect(0, 0, W, H), Qt.AlignCenter,
+                       "NO DATA — START SESSION FIRST")
+            p.end(); return
+
+        PAD = 52; gW = W - PAD - 10; gH = H - 46
+        mn, mx = min(self._d), max(self._d); rng = mx - mn or 1
+
+        # grid lines + y labels
+        for i in range(5):
+            y   = 26 + gH * i // 4
+            val = mx - rng * i / 4
+            p.setPen(QPen(QColor("#181818"), 1, Qt.DashLine))
+            p.drawLine(PAD, y, PAD + gW, y)
+            p.setPen(QColor("#444"))
+            p.setFont(QFont("Courier New", 7))
+            p.drawText(QRect(0, y - 8, PAD - 4, 16),
+                       Qt.AlignRight | Qt.AlignVCenter, f"{val:.2f}")
+
+        # filled area
+        n    = len(self._d)
+        path = QPainterPath()
+        path.moveTo(PAD, 26 + gH)
+        for i, v in enumerate(self._d):
+            x = PAD + int(gW * i / (n - 1))
+            y = 26  + int(gH * (mx - v) / rng)
+            path.lineTo(x, y)
+        path.lineTo(PAD + gW, 26 + gH)
+        path.closeSubpath()
+        grad = QLinearGradient(0, 26, 0, 26 + gH)
+        c1 = QColor(self._col); c1.setAlpha(55)
+        c2 = QColor(self._col); c2.setAlpha(0)
+        grad.setColorAt(0, c1); grad.setColorAt(1, c2)
+        p.fillPath(path, QBrush(grad))
+
+        # data line
+        p.setPen(QPen(self._col, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        prev = None
+        for i, v in enumerate(self._d):
+            pt = QPoint(PAD + int(gW * i / (n - 1)),
+                        26 + int(gH * (mx - v) / rng))
+            if prev: p.drawLine(prev, pt)
+            prev = pt
+
+        # labels
+        p.setPen(self._col)
+        p.setFont(QFont("Courier New", 9, QFont.Bold))
+        p.drawText(PAD, 18, f"{self.title.upper()}  [{self.unit}]  ·  {n} pts")
+        p.setPen(QColor("#333"))
+        p.setFont(QFont("Courier New", 7))
+        p.drawText(PAD, H - 4, "SESSION START")
+        p.drawText(PAD + gW - 30, H - 4, "NOW")
+        p.end()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TOP BAR
+# ═════════════════════════════════════════════════════════════════════════════
+class TopBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(38)
+        self.setStyleSheet("background:#060606; border-bottom:1px solid #181818;")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(8)
+
+        title = QLabel("RAIL INSPECTION UNIT  v4.0")
+        title.setStyleSheet("color:#282828; font-size:8pt; letter-spacing:2px;")
+
+        self._bars = QLabel("▯▯▯▯")
+        self._bars.setStyleSheet("color:#333; font-size:11pt;")
+        self._ltxt = QLabel("LTE")
+        self._ltxt.setStyleSheet("color:#333; font-size:8pt; font-weight:bold;")
+
+        self._cic  = QLabel("☁")
+        self._cic.setStyleSheet("font-size:13pt; color:#333;")
+        self._ctxt = QLabel("OFFLINE")
+        self._ctxt.setStyleSheet("color:#333; font-size:8pt; font-weight:bold;")
+
+        self._sim  = QLabel("[ SIM ]" if HW_SIM else "[ HW ]")
+        self._sim.setStyleSheet(
+            f"color:{'#FFCC00' if HW_SIM else '#39FF14'}; font-size:8pt; font-weight:bold;")
+
+        self._tclock = QLabel("--:--:--")
+        self._tclock.setStyleSheet(
+            "color:#CCC; font-size:10pt; font-family:'Courier New'; letter-spacing:1px;")
+        self._tdate = QLabel("-- --- ----")
+        self._tdate.setStyleSheet("color:#444; font-size:7pt;")
+        tc = QVBoxLayout(); tc.setSpacing(0)
+        tc.addWidget(self._tclock); tc.addWidget(self._tdate)
+
+        self._errbtn = QPushButton("🔔  OK")
+        self._errbtn.setStyleSheet(
+            "background:#030903; border:1px solid #183018; border-radius:5px;"
+            " color:#1a5a1a; font-size:8pt; padding:2px 8px;")
+        self._errs = []
+
+        for w in (title, None, self._sim, _vline(),
+                  self._bars, self._ltxt, _vline(),
+                  self._cic, self._ctxt, _vline()):
+            if w is None:
+                lay.addStretch()
+            elif isinstance(w, QFrame):
+                lay.addWidget(w)
+            else:
+                lay.addWidget(w)
+        lay.addLayout(tc)
+        lay.addWidget(_vline())
+        lay.addWidget(self._errbtn)
+
+        tmr = QTimer(self)
+        tmr.timeout.connect(self._tick)
+        tmr.start(1000)
+        self._tick()
+
+    def _tick(self):
+        n = datetime.now()
+        self._tclock.setText(n.strftime("%H:%M:%S"))
+        self._tdate.setText(n.strftime("%d %b %Y"))
+
+    def update_net(self, bars, cloud):
+        col = NEON if bars >= 3 else AMBER if bars >= 1 else RED
+        self._bars.setText("▮" * bars + "▯" * (4 - bars))
+        self._bars.setStyleSheet(f"color:{col}; font-size:11pt;")
+        self._ltxt.setStyleSheet(f"color:{col}; font-size:8pt; font-weight:bold;")
+        c = CYAN if cloud else RED
+        self._cic.setStyleSheet(f"font-size:13pt; color:{c};")
+        self._ctxt.setText("CLOUD OK" if cloud else "NO SYNC")
+        self._ctxt.setStyleSheet(f"color:{c}; font-size:8pt; font-weight:bold;")
+
+    def push_error(self, msg):
+        self._errs.append(msg)
+        self._errbtn.setText(f"🔔  {len(self._errs)} ERR")
+        self._errbtn.setStyleSheet(
+            f"background:#1a0000; border:1px solid {RED}; border-radius:5px;"
+            f" color:{RED}; font-size:8pt; padding:2px 8px;")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONTROL BAR
+# ═════════════════════════════════════════════════════════════════════════════
+class ControlBar(QWidget):
+    sig_cal  = pyqtSignal()
+    sig_mark = pyqtSignal(int)
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setFixedHeight(44)
+        self.setStyleSheet(
+            "background:#060606; border-bottom:1px solid #141414;")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(8)
+
+        # CSV path display (read-only label; path chosen from dashboard)
+        self._csv_lbl = QLabel("📁  " + _shorten(cfg["csv_dir"]))
+        self._csv_lbl.setStyleSheet(
+            "background:#111; border:1px solid #333; border-radius:5px;"
+            " color:#666; font-size:8pt; padding:3px 10px;"
+            " font-family:'Courier New';")
+        self._csv_lbl.setFixedHeight(32)
+
+        # Calibrate button
+        cal = QPushButton("⚙  CALIBRATE")
+        cal.setStyleSheet(
+            f"QPushButton{{background:#1a1500; border:2px solid {AMBER};"
+            f" border-radius:5px; color:{AMBER}; font-size:9pt;"
+            f" font-weight:bold; padding:3px 14px; min-height:32px;}}"
+            f"QPushButton:pressed{{background:#251d00;}}")
+        cal.clicked.connect(self.sig_cal)
+
+        # Mark-last-N-seconds
+        hl_lbl = QLabel("MARK LAST")
+        hl_lbl.setStyleSheet("color:#333; font-size:8pt;")
+
+        self._stepper = Stepper(
+            cfg.get("hl_sec", 30), step=5, dec=0,
+            lo=5, hi=600, unit="s", title="HIGHLIGHT SECONDS",
+        )
+        self._stepper.setFixedWidth(200)
+
+        mark = QPushButton("MARK")
+        mark.setStyleSheet(
+            f"QPushButton{{background:#001520; border:2px solid {CYAN};"
+            f" border-radius:5px; color:{CYAN}; font-size:9pt;"
+            f" font-weight:bold; padding:3px 12px; min-height:32px;}}"
+            f"QPushButton:pressed{{background:#002030;}}")
+        mark.clicked.connect(lambda: self.sig_mark.emit(int(self._stepper.value())))
+
+        lay.addWidget(self._csv_lbl)
+        lay.addWidget(cal)
+        lay.addStretch()
+        lay.addWidget(hl_lbl)
+        lay.addWidget(self._stepper)
+        lay.addWidget(mark)
+
+    def set_csv_path(self, path):
+        self._csv_lbl.setText("📁  " + _shorten(path))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  METRIC CARD
+# ═════════════════════════════════════════════════════════════════════════════
+_THRESH = {
+    "gauge": (0.5, 1.5),
+    "cross": (0.8, 1.5),
+    "twist": (0.40, 0.80),
+    "dist":  (None, None),
+}
+
+
+class MetricCard(QFrame):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, key, title, unit, color, parent=None):
+        super().__init__(parent)
+        self.key   = key
+        self.color = color
+        self.setObjectName("Card")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 5)
+        lay.setSpacing(0)
+
+        self._title = QLabel(title.upper())
+        self._title.setAlignment(Qt.AlignCenter)
+        self._title.setStyleSheet(
+            "color:#ffffff; font-size:11pt; font-weight:bold; letter-spacing:3px;"
+            " background:#808080; border-radius:4px; padding:3px 6px;")
+
+        self._val = QLabel("---")
+        self._val.setAlignment(Qt.AlignCenter)
+        self._val.setStyleSheet(
+            f"color:{color}; font-size:20pt; font-family:'Courier New';"
+            f" font-weight:bold;")
+        self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self._unit = QLabel(unit)
+        self._unit.setAlignment(Qt.AlignCenter)
+        self._unit.setStyleSheet("color:#2a2a2a; font-size:9pt;")
+
+        self._alert = QLabel("")
+        self._alert.setAlignment(Qt.AlignCenter)
+        self._alert.setStyleSheet(
+            f"color:{RED}; font-size:8pt; font-weight:bold; letter-spacing:2px;")
+
+        lay.addWidget(self._title)
+        lay.addWidget(self._val, 1)
+        lay.addWidget(self._unit)
+        lay.addWidget(self._alert)
+
+    def refresh(self, val):
+        self._val.setText(str(val))
+        warn, alarm = _THRESH.get(self.key, (None, None))
+        dev = (abs(float(val) - 1435.0) if self.key == "gauge"
+               else abs(float(val)))
+        if alarm is not None and dev >= alarm:
+            vc, txt = RED,   "⚠  ALARM"
+            bg = f"QFrame#Card{{background:#0f0000;border:1px solid {RED};border-radius:10px;}}"
+        elif warn is not None and dev >= warn:
+            vc, txt = AMBER, "△  WARN"
+            bg = f"QFrame#Card{{background:#100800;border:1px solid {AMBER};border-radius:10px;}}"
+        else:
+            vc, txt = self.color, ""
+            bg = "QFrame#Card{background:#0c0c0c;border:1px solid #1c1c1c;border-radius:10px;}"
+        self._val.setStyleSheet(
+            f"color:{vc}; font-size:20pt; font-family:'Courier New'; font-weight:bold;")
+        self._alert.setText(txt)
+        self.setStyleSheet(bg)
+
+    def mousePressEvent(self, _):
+        self.clicked.emit(self.key)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  GRAPH PAGE  (full-screen inside stack — no floating overlay)
+# ═════════════════════════════════════════════════════════════════════════════
+class GraphPage(QWidget):
+    sig_back = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 8)
+        lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        back = _btn("← BACK", "BC", 46, 140)
+        back.clicked.connect(self.sig_back)
+        self._lbl = QLabel("—")
+        self._lbl.setStyleSheet(
+            f"color:{CYAN}; font-size:11pt; font-weight:bold; letter-spacing:2px;")
+        hdr.addWidget(back)
+        hdr.addSpacing(12)
+        hdr.addWidget(self._lbl)
+        hdr.addStretch()
+        lay.addLayout(hdr)
+
+        self._canvas = GraphCanvas()
+        lay.addWidget(self._canvas, 1)
+
+    def load(self, title, unit, data, color):
+        self._lbl.setText(f"▸  {title.upper()} — SESSION HISTORY")
+        self._canvas._col = QColor(color)
+        self._canvas.load(data, title, unit)
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LIVE TERMINAL WIDGET
+#  Streams every stdout/stderr line live into an on-screen green-on-black pane.
+#  Call .run(cmd) with any shell command string.
+#  Signal finished(exit_code:int, full_output:str) emitted when done.
+# ═════════════════════════════════════════════════════════════════════════════
+class TerminalWidget(QWidget):
+    finished = pyqtSignal(int, str)
+
+    def __init__(self, height=200, parent=None):
+        super().__init__(parent)
+        self._full_out = ""
+        self._procs    = []          # keep QProcess refs alive
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+
+        hdr = QHBoxLayout()
+        self._cmd_lbl = QLabel("$  —")
+        self._cmd_lbl.setStyleSheet(
+            "color:#39FF14; font-size:8pt; font-family:'Courier New';"
+            " background:#020a02; padding:3px 8px; border-radius:3px 3px 0 0;")
+        self._stat = QLabel("IDLE")
+        self._stat.setStyleSheet(
+            "color:#333; font-size:8pt; font-weight:bold;"
+            " font-family:'Courier New'; padding:3px 8px;")
+        hdr.addWidget(self._cmd_lbl, 1)
+        hdr.addWidget(self._stat)
+        lay.addLayout(hdr)
+
+        self._out = QTextEdit()
+        self._out.setReadOnly(True)
+        self._out.setFixedHeight(height)
+        self._out.setStyleSheet(
+            "QTextEdit { background:#020a02; border:1px solid #0d2b0d;"
+            " border-radius:0 0 4px 4px; color:#39FF14;"
+            " font-size:8pt; font-family:'Courier New'; }")
+        lay.addWidget(self._out)
+
+    # ── public API ────────────────────────────────────────────────────────────
+    def run(self, cmd):
+        """Run a shell command.  Returns the QProcess (caller may keep ref)."""
+        self._full_out = ""
+        self._out.clear()
+        self._cmd_lbl.setText("$  " + cmd[:140])
+        self._set_status("RUNNING", AMBER)
+
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        # connect per-proc so lambda captures correct proc reference
+        proc.readyReadStandardOutput.connect(
+            lambda p=proc: self._read(p))
+        proc.finished.connect(
+            lambda code, status, p=proc: self._done(code, p))
+        proc.start("sh", ["-c", cmd])
+        self._procs.append(proc)
+        return proc
+
+    def append(self, text):
+        """Manually write a note into the pane."""
+        self._out.append(text)
+        self._scroll()
+
+    def clear_output(self):
+        self._out.clear()
+        self._full_out = ""
+        self._cmd_lbl.setText("$  —")
+        self._set_status("IDLE", "#333")
+
+    # ── internal ──────────────────────────────────────────────────────────────
+    def _read(self, proc):
+        raw = proc.readAllStandardOutput().data().decode(errors="replace")
+        self._full_out += raw
+        for line in raw.splitlines():
+            if line.strip():
+                self._out.append(line)
+        self._scroll()
+
+    def _done(self, code, proc):
+        # drain any remaining bytes
+        raw = proc.readAllStandardOutput().data().decode(errors="replace")
+        if raw.strip():
+            self._full_out += raw
+            for line in raw.splitlines():
+                if line.strip():
+                    self._out.append(line)
+        ok = (code == 0)
+        self._set_status(f"EXIT {code}", NEON if ok else RED)
+        self._out.append(f"\n{'─'*40}\n{'OK' if ok else 'FAIL'}  exit={code}")
+        self._scroll()
+        self.finished.emit(code, self._full_out)
+
+    def _scroll(self):
+        sb = self._out.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _set_status(self, txt, color):
+        self._stat.setText(txt)
+        self._stat.setStyleSheet(
+            f"color:{color}; font-size:8pt; font-weight:bold;"
+            f" font-family:'Courier New'; padding:3px 8px;")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ENCODER CAL
+# ═════════════════════════════════════════════════════════════════════════════
+class EncoderCal(QWidget):
+    saved = pyqtSignal(str, dict)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg    = cfg
+        self._scale = None
+        self._phase = "idle"
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(_lbl("ROTARY ENCODER (eQEP) — ODOMETER CALIBRATION",
+                           NEON, 10, True))
+        lay.addWidget(_lbl(
+            "① Set known distance below   "
+            "② Tap RESET COUNTER   "
+            "③ Roll trolley exact that distance   "
+            "④ Tap CAPTURE & COMPUTE", "#555", 8))
+
+        dr = QHBoxLayout()
+        dr.addWidget(_lbl("Known distance:", "#888"))
+        self._dist_s = Stepper(1000, step=100, dec=0, lo=100, hi=50000,
+                               unit="mm", title="KNOWN DISTANCE")
+        dr.addWidget(self._dist_s, 1)
+        lay.addLayout(dr)
+
+        br = QHBoxLayout(); br.setSpacing(8)
+        self._rst_btn = _btn("① RESET COUNTER",     "BG", 50)
+        self._cap_btn = _btn("② CAPTURE & COMPUTE", "BC", 50)
+        self._cap_btn.setEnabled(False)
+        self._rst_btn.clicked.connect(self._do_reset)
+        self._cap_btn.clicked.connect(self._do_capture)
+        br.addWidget(self._rst_btn, 1)
+        br.addWidget(self._cap_btn, 1)
+        lay.addLayout(br)
+
+        self._term = TerminalWidget(height=150)
+        self._term.finished.connect(self._on_done)
+        lay.addWidget(self._term)
+
+        self._res = _lbl("", NEON)
+        lay.addWidget(self._res)
+
+        sv = _btn("SAVE CALIBRATION ✓", "BA", 48)
+        sv.clicked.connect(self._do_save)
+        lay.addWidget(sv)
+
+        ok = cfg["encoder"].get("calibrated", False)
+        sc = cfg["encoder"].get("scale", 1.0)
+        self._info = _lbl(
+            ("✓ CALIBRATED" if ok else "✗ NOT CALIBRATED")
+            + f"  |  scale={sc:.5f} mm/count",
+            NEON if ok else RED)
+        lay.addWidget(self._info)
+        lay.addStretch()
+
+    def _cmd_reset(self):
+        if os.path.exists(EQEP_PATH):
+            return (f"echo '# Resetting eQEP counter...' && "
+                    f"echo '# Path: {EQEP_PATH}' && "
+                    f"echo 0 > {EQEP_PATH} && "
+                    f"echo '# Verify reset:' && cat {EQEP_PATH}")
+        cnt = random.randint(1800, 2400)
+        return (f"echo '# [SIM] eQEP not present — simulation mode' && "
+                f"sleep 0.3 && echo 'Counter reset to: 0'")
+
+    def _cmd_read(self):
+        if os.path.exists(EQEP_PATH):
+            return (f"echo '# Reading eQEP counter after trolley roll...' && "
+                    f"cat {EQEP_PATH}")
+        cnt = random.randint(1800, 2400)
+        return (f"echo '# [SIM] Reading simulated eQEP counter...' && "
+                f"sleep 0.4 && echo 'Counter value: {cnt}'")
+
+    def _do_reset(self):
+        self._phase = "reset"
+        self._cap_btn.setEnabled(False)
+        self._term.append(f"# EQEP path: {EQEP_PATH}")
+        self._term.run(self._cmd_reset())
+
+    def _do_capture(self):
+        self._phase = "capture"
+        self._term.run(self._cmd_read())
+
+    def _on_done(self, code, out):
+        if code != 0:
+            return
+        if self._phase == "reset":
+            self._term.append(
+                "✓ Counter zeroed.\n"
+                "  Roll trolley the exact known distance, then tap CAPTURE.")
+            self._cap_btn.setEnabled(True)
+        elif self._phase == "capture":
+            nums = [w.strip(":,") for w in out.split() if w.strip(":,").lstrip("-").isdigit()]
+            if not nums:
+                self._term.append("⚠  Could not parse count from output"); return
+            count = int(nums[-1])
+            if count == 0:
+                self._term.append("⚠  Count is still zero — did you roll the trolley?")
+                return
+            self._scale = self._dist_s.value() / count
+            self._res.setText(
+                f"Count: {count}   →   Scale: {self._scale:.5f} mm/count"
+                f"   ({1/self._scale:.1f} cts/mm)")
+            self._term.append(
+                f"\n# Result: {self._dist_s.value()} mm / {count} counts"
+                f" = {self._scale:.5f} mm/count")
+
+    def _do_save(self):
+        if self._scale is None:
+            self._term.append("⚠  Complete steps ① and ② first"); return
+        self.cfg["encoder"].update({"scale": self._scale, "calibrated": True})
+        save_cfg(self.cfg)
+        self._info.setText(f"✓ CALIBRATED  |  scale={self._scale:.5f} mm/count")
+        self._info.setStyleSheet(f"color:{NEON}; font-size:9pt;")
+        self._term.append("✓ Saved to rail_config.json")
+        self.saved.emit("encoder", self.cfg["encoder"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ADC / GAUGE CAL
+# ═════════════════════════════════════════════════════════════════════════════
+class ADCCal(QWidget):
+    saved = pyqtSignal(str, dict)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg       = cfg
+        self._zero_raw = None
+        self._mpc      = None
+        self._phase    = "zero"
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(_lbl("GAUGE POTENTIOMETER (TRS100) — ADC CALIBRATION",
+                           CYAN, 10, True))
+        lay.addWidget(_lbl(
+            "① Set gauge to exactly 1435 mm → tap READ ZERO\n"
+            "② Shift gauge by known offset → tap READ OFFSET", "#555", 8))
+
+        self._z_btn = _btn("① READ ZERO  (gauge @ 1435 mm)", "BC", 50)
+        self._z_btn.clicked.connect(self._read_zero)
+        lay.addWidget(self._z_btn)
+
+        dr = QHBoxLayout()
+        dr.addWidget(_lbl("Known offset:", "#888"))
+        self._off_s = Stepper(5.0, step=0.5, dec=2, lo=-30, hi=30,
+                              unit="mm", title="GAUGE OFFSET")
+        dr.addWidget(self._off_s, 1)
+        lay.addLayout(dr)
+
+        self._o_btn = _btn("② READ OFFSET (after shift)", "BC", 50)
+        self._o_btn.setEnabled(False)
+        self._o_btn.clicked.connect(self._read_offset)
+        lay.addWidget(self._o_btn)
+
+        self._term = TerminalWidget(height=150)
+        self._term.finished.connect(self._on_done)
+        lay.addWidget(self._term)
+
+        self._res = _lbl("", CYAN)
+        lay.addWidget(self._res)
+
+        sv = _btn("SAVE CALIBRATION ✓", "BA", 48)
+        sv.clicked.connect(self._do_save)
+        lay.addWidget(sv)
+
+        ok  = cfg["adc"].get("calibrated", False)
+        z   = cfg["adc"].get("zero", 2048)
+        mpc = cfg["adc"].get("mpc", 0.0684)
+        self._info = _lbl(
+            ("✓ CALIBRATED" if ok else "✗ NOT CALIBRATED")
+            + f"  |  zero={z}  mpc={mpc:.5f}",
+            NEON if ok else RED)
+        lay.addWidget(self._info)
+        lay.addStretch()
+
+    def _adc_cmd(self):
+        if os.path.exists(ADC_PATH):
+            return (f"echo '# Reading IIO ADC device...' && "
+                    f"echo '# Path: {ADC_PATH}' && "
+                    f"echo -n 'Raw ADC value: ' && cat {ADC_PATH}")
+        val = random.randint(1950, 2150)
+        return (f"echo '# [SIM] IIO ADC not present — simulation mode' && "
+                f"sleep 0.3 && echo 'Raw ADC value: {val}'")
+
+    def _read_zero(self):
+        self._phase = "zero"
+        self._term.run(self._adc_cmd())
+
+    def _read_offset(self):
+        self._phase = "offset"
+        self._term.append(f"\n# Reading ADC after {self._off_s.value():.2f} mm shift...")
+        self._term.run(self._adc_cmd())
+
+    def _on_done(self, code, out):
+        if code != 0:
+            return
+        nums = [w.strip(":,") for w in out.split()
+                if w.strip(":,").lstrip("-").isdigit()]
+        if not nums:
+            self._term.append("⚠  Could not parse ADC raw value"); return
+        val = int(nums[-1])
+
+        if self._phase == "zero":
+            self._zero_raw = val
+            self._term.append(
+                f"✓ Zero raw = {val}  (gauge at 1435 mm)\n"
+                f"  Shift gauge by {self._off_s.value():.2f} mm, then tap READ OFFSET.")
+            self._o_btn.setEnabled(True)
+        elif self._phase == "offset":
+            if self._zero_raw is None:
+                return
+            delta = val - self._zero_raw
+            if delta == 0:
+                self._term.append("⚠  Δ is zero — did you shift the gauge?"); return
+            self._mpc = self._off_s.value() / delta
+            self._res.setText(
+                f"ADC: {val}  Δ={delta}  mpc={self._mpc:.5f} mm/count")
+            self._term.append(
+                f"\n# {self._off_s.value():.2f} mm / {delta} ADC-counts"
+                f" = {self._mpc:.5f} mm/count")
+
+    def _do_save(self):
+        if self._zero_raw is None or self._mpc is None:
+            self._term.append("⚠  Complete both steps first"); return
+        self.cfg["adc"].update({"zero": self._zero_raw, "mpc": self._mpc,
+                                "calibrated": True})
+        save_cfg(self.cfg)
+        self._info.setText(
+            f"✓ CALIBRATED  |  zero={self._zero_raw}  mpc={self._mpc:.5f}")
+        self._info.setStyleSheet(f"color:{NEON}; font-size:9pt;")
+        self._term.append("✓ Saved to rail_config.json")
+        self.saved.emit("adc", self.cfg["adc"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  INCLINOMETER CAL
+# ═════════════════════════════════════════════════════════════════════════════
+_SPI_SCRIPT_SRC = """\
+import spidev, time, sys
+try:
+    spi = spidev.SpiDev()
+    spi.open(1, 0)
+    spi.max_speed_hz = 1_000_000
+    spi.mode = 0
+    print("SCL3300: initialising SPI bus...")
+    spi.xfer2([0xB4, 0x00, 0x00, 0x1F])   # wake-up
+    time.sleep(0.025)
+    r = spi.xfer2([0x04, 0x00, 0x00, 0x00])  # read ACC_Y
+    spi.close()
+    raw = (r[1] << 8) | r[2]
+    if raw > 32767:
+        raw -= 65536
+    angle = raw / 16384.0 * 90.0
+    print(f"SPI raw={raw}  angle={angle:.6f}")
+except Exception as e:
+    print(f"SPI ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+"""
+
+_SPI_SIM_SRC = """\
+import random, time
+print("# [SIM] /dev/spidev1.0 not present — simulation mode")
+time.sleep(0.3)
+a = random.gauss(0, 0.12)
+raw = int(a * 182)
+print(f"SPI raw={raw}  angle={a:.6f}")
+"""
+
+
+class InclinCal(QWidget):
+    saved = pyqtSignal(str, dict)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg     = cfg
+        self._offset = None
+        self._phase  = "idle"
+
+        # write helper script to /tmp
+        script_src = _SPI_SCRIPT_SRC if os.path.exists(SPI_DEV) else _SPI_SIM_SRC
+        self._script = Path("/tmp/_scl3300_read.py")
+        try:
+            self._script.write_text(script_src)
+        except Exception:
+            pass
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(_lbl("INCLINOMETER SCL3300 (SPI1.0) — CROSS-LEVEL ZERO",
+                           AMBER, 10, True))
+        lay.addWidget(_lbl(
+            "① Place trolley on certified flat track surface\n"
+            "② Tap READ ZERO to capture zero-reference angle\n"
+            "③ Tap VERIFY — corrected reading must be < ±0.05°", "#555", 8))
+
+        br = QHBoxLayout(); br.setSpacing(8)
+        self._z_btn = _btn("① READ ZERO", "BA", 50)
+        self._v_btn = _btn("② VERIFY",    "BA", 50)
+        self._v_btn.setEnabled(False)
+        self._z_btn.clicked.connect(self._read_zero)
+        self._v_btn.clicked.connect(self._verify)
+        br.addWidget(self._z_btn, 1)
+        br.addWidget(self._v_btn, 1)
+        lay.addLayout(br)
+
+        self._term = TerminalWidget(height=160)
+        self._term.finished.connect(self._on_done)
+        lay.addWidget(self._term)
+
+        self._res = _lbl("", AMBER)
+        lay.addWidget(self._res)
+
+        sv = _btn("SAVE CALIBRATION ✓", "BA", 48)
+        sv.clicked.connect(self._do_save)
+        lay.addWidget(sv)
+
+        ok  = cfg["incl"].get("calibrated", False)
+        off = cfg["incl"].get("offset", 0.0)
+        self._info = _lbl(
+            ("✓ CALIBRATED" if ok else "✗ NOT CALIBRATED")
+            + f"  |  offset={off:.5f}°",
+            NEON if ok else RED)
+        lay.addWidget(self._info)
+        lay.addStretch()
+
+    def _spi_cmd(self):
+        return f"echo '# Running SPI reader: {self._script}' && python3 {self._script}"
+
+    def _read_zero(self):
+        self._phase = "zero"
+        self._term.run(self._spi_cmd())
+
+    def _verify(self):
+        self._phase = "verify"
+        self._term.append("\n# Re-reading to verify zero correction...")
+        self._term.run(self._spi_cmd())
+
+    def _on_done(self, code, out):
+        if code != 0:
+            return
+        angle = None
+        for tok in out.split():
+            if "angle=" in tok:
+                try:
+                    angle = float(tok.split("=")[1]); break
+                except ValueError:
+                    pass
+        if angle is None:
+            self._term.append("⚠  Could not parse angle from output"); return
+
+        if self._phase == "zero":
+            self._offset = angle
+            self._res.setText(f"Zero offset stored: {angle:.5f}°")
+            self._term.append(
+                f"\n✓ Zero offset = {angle:.5f}°\n"
+                "  Tap VERIFY to confirm correction is < ±0.05°.")
+            self._v_btn.setEnabled(True)
+        elif self._phase == "verify":
+            corr = angle - (self._offset or 0.0)
+            ok   = abs(corr) < 0.05
+            self._res.setText(
+                f"Corrected: {corr:.4f}°  "
+                + ("✓ PASS (<0.05°)" if ok else f"⚠  {corr:.4f}° — re-zero"))
+            self._res.setStyleSheet(
+                f"color:{NEON if ok else AMBER}; font-size:9pt;")
+
+    def _do_save(self):
+        if self._offset is None:
+            self._term.append("⚠  Read zero first"); return
+        self.cfg["incl"].update({"offset": self._offset, "calibrated": True})
+        save_cfg(self.cfg)
+        self._info.setText(f"✓ CALIBRATED  |  offset={self._offset:.5f}°")
+        self._info.setStyleSheet(f"color:{NEON}; font-size:9pt;")
+        self._term.append("✓ Saved to rail_config.json")
+        self.saved.emit("incl", self.cfg["incl"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  GNSS CAL
+# ═════════════════════════════════════════════════════════════════════════════
+class GNSSCal(QWidget):
+    saved = pyqtSignal(str, dict)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg     = cfg
+        self._action = ""
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(_lbl("GNSS  u-blox NEO-M8P-2  (/dev/ttyS4) — FIX & CHAINAGE",
+                           MAGI, 10, True))
+        lay.addWidget(_lbl(
+            "Start gpsd → check fix (≥4 sats for survey) → "
+            "optionally enable RTK → set reference chainage → SAVE", "#555", 8))
+
+        g = QGridLayout(); g.setSpacing(8)
+        for i, (lbl, fn, nm) in enumerate([
+            ("▶ START gpsd",  self._start_gpsd,  "BM"),
+            ("■ STOP gpsd",   self._stop_gpsd,   "BM"),
+            ("⊛ CHECK FIX",  self._check_fix,   "BM"),
+            ("⚡ RTK MODE",   self._rtk,         "BM"),
+        ]):
+            b = _btn(lbl, nm, 50)
+            b.clicked.connect(fn)
+            g.addWidget(b, i // 2, i % 2)
+        lay.addLayout(g)
+
+        self._term = TerminalWidget(height=170)
+        self._term.finished.connect(self._on_done)
+        lay.addWidget(self._term)
+
+        rc = QHBoxLayout()
+        rc.addWidget(_lbl("Reference chainage:", "#888"))
+        self._ch_s = Stepper(cfg["gnss"]["ref_ch"], step=100, dec=1,
+                             lo=0, hi=9_999_999, unit="m", title="REF CHAINAGE")
+        rc.addWidget(self._ch_s, 1)
+        lay.addLayout(rc)
+
+        sv = _btn("SAVE CONFIGURATION ✓", "BA", 48)
+        sv.clicked.connect(self._do_save)
+        lay.addWidget(sv)
+
+        ok = cfg["gnss"].get("calibrated", False)
+        self._info = _lbl(
+            ("✓ CONFIGURED" if ok else "✗ NOT CONFIGURED")
+            + f"  |  ref={cfg['gnss']['ref_ch']:.1f} m",
+            NEON if ok else RED)
+        lay.addWidget(self._info)
+        lay.addStretch()
+
+    def _start_gpsd(self):
+        self._action = "start"
+        cmd = (
+            "echo '# Starting gpsd service on Ubuntu...' && "
+            "sudo systemctl start gpsd 2>&1 && "
+            "sleep 1 && "
+            "echo '# Service status:' && "
+            "systemctl is-active gpsd && "
+            "echo '# Socket status:' && "
+            "systemctl is-active gpsd.socket 2>/dev/null || true"
+        ) if not HW_SIM else (
+            "echo '# [SIM] sudo systemctl start gpsd' && "
+            "sleep 0.5 && echo 'gpsd.service: active (running)'"
+        )
+        self._term.run(cmd)
+
+    def _stop_gpsd(self):
+        self._action = "stop"
+        cmd = (
+            "echo '# Stopping gpsd...' && "
+            "sudo systemctl stop gpsd 2>&1 && "
+            "echo 'gpsd stopped.'"
+        ) if not HW_SIM else (
+            "echo '# [SIM] sudo systemctl stop gpsd' && "
+            "sleep 0.3 && echo 'gpsd stopped.'"
+        )
+        self._term.run(cmd)
+
+    def _check_fix(self):
+        self._action = "fix"
+        cmd = (
+            "echo '# Polling GNSS (10 s timeout)...' && "
+            "timeout 10 gpspipe -r -n 25 2>&1 | grep -m1 'GGA' || "
+            "echo 'No GGA sentence — is gpsd running and antenna connected?'"
+        ) if not HW_SIM else (
+            "echo '# [SIM] gpspipe -r -n 25 | grep GGA' && "
+            "sleep 0.8 && "
+            "echo '$GPGGA,123519,1259.04,N,07730.18,E,1,08,0.9,920.4,M,46.9,M,,*47'"
+        )
+        self._term.append("# Checking GNSS fix quality (wait up to 10 s)...")
+        self._term.run(cmd)
+
+    def _rtk(self):
+        self._action = "rtk"
+        cmd = (
+            "echo '# Enabling RTK via ubxtool...' && "
+            "ubxtool -p RTCM 2>&1 | head -30"
+        ) if not HW_SIM else (
+            "echo '# [SIM] ubxtool -p RTCM' && "
+            "sleep 0.5 && echo 'RTK RTCM3 output enabled on NEO-M8P-2'"
+        )
+        self._term.run(cmd)
+
+    def _on_done(self, code, out):
+        if self._action == "fix":
+            for line in out.splitlines():
+                if "GGA" in line:
+                    p = line.split(",")
+                    try:
+                        q    = int(p[6]) if len(p) > 6 else 0
+                        sats = int(p[7]) if len(p) > 7 else 0
+                        alt  = p[9]      if len(p) > 9 else "?"
+                        qual = {0:"No fix", 1:"GPS fix", 2:"DGPS",
+                                4:"RTK Fixed", 5:"RTK Float"}.get(q, str(q))
+                        col  = NEON if q >= 1 else RED
+                        self._term.append(
+                            f"\n→ Quality: {qual}  Satellites: {sats}  Alt: {alt} m")
+                        self._info.setStyleSheet(f"color:{col}; font-size:9pt;")
+                    except Exception:
+                        pass
+                    return
+
+    def _do_save(self):
+        self.cfg["gnss"].update({"ref_ch": self._ch_s.value(), "calibrated": True})
+        save_cfg(self.cfg)
+        self._info.setText(
+            f"✓ CONFIGURED  |  ref={self._ch_s.value():.1f} m")
+        self._info.setStyleSheet(f"color:{NEON}; font-size:9pt;")
+        self._term.append("✓ Saved to rail_config.json")
+        self.saved.emit("gnss", self.cfg["gnss"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LTE STATUS
+# ═════════════════════════════════════════════════════════════════════════════
+class LTECal(QWidget):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(_lbl("LTE MODEM  (cdc_ether) — NETWORK DIAGNOSTICS",
+                           CYAN, 10, True))
+        lay.addWidget(_lbl(
+            "Modem appears as Ethernet via cdc_ether kernel driver.\n"
+            "Select interface then run diagnostics to verify connectivity.", "#555", 8))
+
+        ir = QHBoxLayout()
+        ir.addWidget(_lbl("Interface:", "#888"))
+        self._iface = PresetTiles(
+            ["eth0", "eth1", "usb0", "wwan0"],
+            selected=cfg.get("lte_iface", "eth1"), color=CYAN)
+        ir.addWidget(self._iface, 1)
+        lay.addLayout(ir)
+
+        g = QGridLayout(); g.setSpacing(8)
+        for i, (lbl, fn, nm) in enumerate([
+            ("IP ADDRESSES",  self._ip,     "BC"),
+            ("PING TEST",     self._ping,   "BC"),
+            ("SHOW ROUTES",   self._routes, "BC"),
+            ("nmcli STATUS",  self._nmcli,  "BC"),
+        ]):
+            b = _btn(lbl, nm, 50)
+            b.clicked.connect(fn)
+            g.addWidget(b, i // 2, i % 2)
+        lay.addLayout(g)
+
+        self._term = TerminalWidget(height=210)
+        lay.addWidget(self._term)
+
+        sv = _btn("SAVE INTERFACE SELECTION ✓", "BA", 48)
+        sv.clicked.connect(self._save)
+        lay.addWidget(sv)
+        lay.addStretch()
+
+    def _ip(self):
+        i = self._iface.value()
+        self._term.run(
+            f"echo '# ip addr show {i}' && ip addr show {i} 2>&1 && "
+            f"echo && echo '# ip link show {i}' && ip link show {i} 2>&1")
+
+    def _ping(self):
+        srv = self.cfg.get("server", "8.8.8.8")
+        self._term.run(
+            f"echo '# ping -c 4 -W 2 {srv}' && ping -c 4 -W 2 {srv} 2>&1")
+
+    def _routes(self):
+        self._term.run("echo '# ip route show' && ip route show 2>&1")
+
+    def _nmcli(self):
+        cmd = (
+            "echo '# nmcli device status' && nmcli device status 2>&1"
+        ) if not HW_SIM else (
+            "echo '# [SIM] nmcli device status' && "
+            "printf 'DEVICE  TYPE      STATE      CONNECTION\\n"
+            "eth1    ethernet  connected  LTE-modem\\n"
+            "eth0    ethernet  connected  local-net\\n'"
+        )
+        self._term.run(cmd)
+
+    def _save(self):
+        self.cfg["lte_iface"] = self._iface.value()
+        save_cfg(self.cfg)
+        self._term.append(f"✓ Interface saved: {self._iface.value()}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DISPLAY CAL
+# ═════════════════════════════════════════════════════════════════════════════
+class DisplayCal(QWidget):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(_lbl("LCD DISPLAY  (HDMI / omapdrm) — XRANDR CONFIGURATION",
+                           AMBER, 10, True))
+
+        for label, options, color, attr in [
+            ("Output:",     ["HDMI-0","HDMI-1","HDMI-A-1","DVI-0"],        AMBER, "_out"),
+            ("Resolution:", ["1024x600","1280x720","800x480","1920x1080"],  AMBER, "_res"),
+            ("Rotation:",   ["normal","left","right","inverted"],           AMBER, "_rot"),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(_lbl(label, "#888"))
+            w = PresetTiles(options, options[0], color)
+            setattr(self, attr, w)
+            row.addWidget(w, 1)
+            lay.addLayout(row)
+
+        g = QGridLayout(); g.setSpacing(8)
+        for i, (lbl, fn, nm) in enumerate([
+            ("APPLY MODE",   self._apply,  "BA"),
+            ("AUTO DETECT",  self._auto,   "BA"),
+            ("SET ROTATION", self._rotate, "BA"),
+            ("LIST MODES",   self._modes,  "BA"),
+        ]):
+            b = _btn(lbl, nm, 50)
+            b.clicked.connect(fn)
+            g.addWidget(b, i // 2, i % 2)
+        lay.addLayout(g)
+
+        self._term = TerminalWidget(height=190)
+        lay.addWidget(self._term)
+        lay.addStretch()
+
+    def _apply(self):
+        cmd = (f"echo '# xrandr --output {self._out.value()} --mode {self._res.value()}' && "
+               f"xrandr --output {self._out.value()} --mode {self._res.value()} 2>&1 && "
+               f"echo 'Mode applied.' || echo 'xrandr error — check output name with LIST MODES'")
+        self._term.run(cmd)
+
+    def _auto(self):
+        cmd = (f"echo '# xrandr --output {self._out.value()} --auto' && "
+               f"xrandr --output {self._out.value()} --auto 2>&1 && echo 'Done.'")
+        self._term.run(cmd)
+
+    def _rotate(self):
+        cmd = (f"echo '# xrandr --output {self._out.value()} --rotate {self._rot.value()}' && "
+               f"xrandr --output {self._out.value()} --rotate {self._rot.value()} 2>&1 && "
+               f"echo 'Rotation set.'")
+        self._term.run(cmd)
+
+    def _modes(self):
+        self._term.run("echo '# xrandr --query' && xrandr 2>&1")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CALIBRATION PAGE
+# ═════════════════════════════════════════════════════════════════════════════
+_SENSORS = [
+    ("encoder", "ENCODER  (eQEP)",     NEON,  EncoderCal),
+    ("adc",     "GAUGE  (ADC/TRS100)", CYAN,  ADCCal),
+    ("incl",    "INCLINOMETER  (SPI)", AMBER, InclinCal),
+    ("gnss",    "GNSS  (NEO-M8P)",     MAGI,  GNSSCal),
+    ("lte",     "LTE  NETWORK",        CYAN,  LTECal),
+    ("display", "DISPLAY  (xrandr)",   AMBER, DisplayCal),
+]
+
+
+class CalibrationPage(QWidget):
+    sig_back = pyqtSignal()
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg   = cfg
+        self._btns = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # header bar
+        hdr_w = QWidget()
+        hdr_w.setFixedHeight(50)
+        hdr_w.setStyleSheet("background:#070707; border-bottom:1px solid #1a1a1a;")
+        hdr = QHBoxLayout(hdr_w)
+        hdr.setContentsMargins(10, 0, 10, 0)
+        back = _btn("← DASHBOARD", "BC", 40, 170)
+        back.clicked.connect(self.sig_back)
+        title = QLabel("⚙   SENSOR CALIBRATION")
+        title.setStyleSheet(
+            f"color:{AMBER}; font-size:13pt; font-weight:bold; letter-spacing:3px;")
+        hdr.addWidget(back); hdr.addStretch()
+        hdr.addWidget(title); hdr.addStretch()
+        root.addWidget(hdr_w)
+
+        # sidebar + content
+        body_w = QWidget()
+        body   = QHBoxLayout(body_w)
+        body.setContentsMargins(8, 8, 8, 8)
+        body.setSpacing(8)
+
+        lf = QFrame(); lf.setObjectName("Panel"); lf.setFixedWidth(190)
+        ll = QVBoxLayout(lf)
+        ll.setContentsMargins(6, 6, 6, 6)
+        ll.setSpacing(5)
+
+        self._stack = QStackedWidget()
+
+        for i, (key, label, color, Cls) in enumerate(_SENSORS):
+            sub = cfg.get(key, {})
+            ok  = sub.get("calibrated", False) if isinstance(sub, dict) else False
+
+            btn = QPushButton(("✓  " if ok else "○  ") + label)
+            btn.setFixedHeight(46)
+            btn.setStyleSheet(
+                "QPushButton{ background:#0c0c0c; border:1px solid #1e1e1e;"
+                " border-radius:8px; color:#555; font-size:8pt;"
+                " font-weight:bold; padding:4px 8px; text-align:left;}"
+                "QPushButton:pressed{ background:#1a1a1a; }")
+            btn.clicked.connect(lambda _, idx=i: self._sel(idx))
+            ll.addWidget(btn)
+            self._btns.append((btn, label, color))
+
+            w = Cls(cfg)
+            if hasattr(w, "saved"):
+                w.saved.connect(self._on_saved)
+
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setStyleSheet("QScrollArea{ border:none; background:#050505; }")
+            sc.setWidget(w)
+            self._stack.addWidget(sc)
+
+        ll.addStretch()
+        body.addWidget(lf)
+
+        rf = QFrame(); rf.setObjectName("Panel")
+        rl = QVBoxLayout(rf)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(self._stack)
+        body.addWidget(rf, 1)
+
+        root.addWidget(body_w, 1)
+        self._sel(0)
+
+    def _sel(self, idx):
+        for i, (btn, _, color) in enumerate(self._btns):
+            if i == idx:
+                btn.setStyleSheet(
+                    f"QPushButton{{ background:{color}18; border:1px solid {color};"
+                    f" border-radius:8px; color:{color}; font-size:8pt;"
+                    f" font-weight:bold; padding:4px 8px; text-align:left;}}"
+                    f"QPushButton:pressed{{ background:{color}28; }}")
+            else:
+                btn.setStyleSheet(
+                    "QPushButton{ background:#0c0c0c; border:1px solid #1e1e1e;"
+                    " border-radius:8px; color:#555; font-size:8pt;"
+                    " font-weight:bold; padding:4px 8px; text-align:left;}"
+                    "QPushButton:pressed{ background:#1a1a1a; }")
+        self._stack.setCurrentIndex(idx)
+
+    def _on_saved(self, key, _):
+        for i, (k, label, color, *_) in enumerate(_SENSORS):
+            if k == key:
+                self._btns[i][0].setText("✓  " + label)
+                break
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DATA ENTRY PAGE  — parameter dropdowns with value + frequency tables
+# ═════════════════════════════════════════════════════════════════════════════
+
+# key, display label, sensor_key, frequency_interval, unit, color
+_PARAM_TABLES = [
+    ("gauge",    "GAUGE",       "gauge", 0.25,  "mm",   NEON),
+    ("cross",    "CROSS-LEVEL", "cross", 0.25,  "mm",   CYAN),
+    ("twist",    "TWIST",       "twist", 2.0,   "mm/m", AMBER),
+    ("chainage", "CHAINAGE",    "dist",  100.0, "m",    MAGI),
+]
+
+
+class ParamTableWidget(QWidget):
+    """Expandable table showing sensor value + auto-incrementing frequency."""
+
+    def __init__(self, label, color, freq_interval, unit, parent=None):
+        super().__init__(parent)
+        self._color        = color
+        self._freq_interval = freq_interval
+        self._unit         = unit
+        self._rows         = []          # list of (freq, value) tuples
+        self._expanded     = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── dropdown header button ────────────────────────────────────────────
+        self._hdr = QPushButton(f"▶   {label}   ( freq: {freq_interval} m )")
+        self._hdr.setFixedHeight(46)
+        self._hdr.setStyleSheet(
+            f"QPushButton{{background:#0c0c0c; border:1px solid {color}55;"
+            f" border-radius:6px; color:{color}; font-size:10pt;"
+            f" font-weight:bold; font-family:'Courier New'; text-align:left;"
+            f" padding-left:12px; letter-spacing:2px;}}"
+            f"QPushButton:pressed{{background:#161616;}}")
+        self._hdr.clicked.connect(self._toggle)
+        root.addWidget(self._hdr)
+
+        # ── collapsible table area ────────────────────────────────────────────
+        self._table_w = QWidget()
+        self._table_w.hide()
+        tv = QVBoxLayout(self._table_w)
+        tv.setContentsMargins(4, 4, 4, 4)
+        tv.setSpacing(2)
+
+        # column headers
+        hdr_row = QHBoxLayout()
+        hdr_row.setSpacing(4)
+        for txt, flex in [("SN", 0), ("FREQ (m)", 1), (f"VALUE ({unit})", 2)]:
+            lbl = QLabel(txt)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(
+                f"color:{color}; font-size:8pt; font-weight:bold;"
+                f" font-family:'Courier New'; letter-spacing:1px;"
+                f" background:#111; border:1px solid #222; padding:4px;")
+            if flex == 0:
+                lbl.setFixedWidth(36)
+            hdr_row.addWidget(lbl, flex)
+        tv.addLayout(hdr_row)
+
+        # scrollable rows area
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFixedHeight(180)
+        self._scroll.setStyleSheet("QScrollArea{border:none;}")
+        self._rows_w  = QWidget()
+        self._rows_lay = QVBoxLayout(self._rows_w)
+        self._rows_lay.setContentsMargins(0, 0, 0, 0)
+        self._rows_lay.setSpacing(2)
+        self._rows_lay.addStretch()
+        self._scroll.setWidget(self._rows_w)
+        tv.addWidget(self._scroll)
+
+        root.addWidget(self._table_w)
+
+    def _toggle(self):
+        self._expanded = not self._expanded
+        arrow = "▼" if self._expanded else "▶"
+        lbl   = self._hdr.text().split("   ", 1)[1]
+        self._hdr.setText(f"{arrow}   {lbl}")
+        self._table_w.setVisible(self._expanded)
+
+    def push_value(self, val):
+        """Add a new sensor reading row with auto-incremented frequency."""
+        n    = len(self._rows) + 1
+        freq = round(n * self._freq_interval, 4)
+        self._rows.append((freq, val))
+
+        row_w = QWidget()
+        rl    = QHBoxLayout(row_w)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+
+        def _cell(txt, flex, bold=False):
+            l = QLabel(str(txt))
+            l.setAlignment(Qt.AlignCenter)
+            w = "bold" if bold else "normal"
+            l.setStyleSheet(
+                f"color:#ccc; font-size:9pt; font-family:'Courier New';"
+                f" font-weight:{w}; background:#0a0a0a;"
+                f" border:1px solid #1a1a1a; padding:3px;")
+            if flex == 0:
+                l.setFixedWidth(36)
+            return l, flex
+
+        sn_l,  sf = _cell(n,    0)
+        fr_l,  ff = _cell(f"{freq:.2f}", 1)
+        val_l, vf = _cell(f"{val}", 2, bold=True)
+        val_l.setStyleSheet(
+            f"color:{self._color}; font-size:9pt; font-family:'Courier New';"
+            f" font-weight:bold; background:#0a0a0a;"
+            f" border:1px solid #1a1a1a; padding:3px;")
+
+        rl.addWidget(sn_l,  sf)
+        rl.addWidget(fr_l,  ff)
+        rl.addWidget(val_l, vf)
+
+        # insert before the stretch
+        self._rows_lay.insertWidget(self._rows_lay.count() - 1, row_w)
+
+        # auto-scroll to bottom
+        sb = self._scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def clear_rows(self):
+        self._rows = []
+        while self._rows_lay.count() > 1:
+            item = self._rows_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def get_rows(self):
+        return list(self._rows)
+
+
+class DataEntryPage(QWidget):
+    sig_back = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._tables = {}   # key → ParamTableWidget
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── header bar ───────────────────────────────────────────────────────
+        hdr_w = QWidget()
+        hdr_w.setFixedHeight(50)
+        hdr_w.setStyleSheet("background:#070707; border-bottom:1px solid #1a1a1a;")
+        hdr = QHBoxLayout(hdr_w)
+        hdr.setContentsMargins(10, 0, 10, 0)
+
+        back = _btn("← DASHBOARD", "BC", 40, 170)
+        back.clicked.connect(self.sig_back)
+
+        title = QLabel("SURVEY DATA ENTRY")
+        title.setStyleSheet(
+            f"color:{CYAN}; font-size:13pt; font-weight:bold; letter-spacing:3px;")
+
+        clr_btn = _btn("🗑  CLEAR ALL", "BR", 40, 150)
+        clr_btn.clicked.connect(self._clear_all)
+
+        sv = _btn("✓  SAVE & BACK", "BG", 40, 170)
+        sv.clicked.connect(self.sig_back)
+
+        hdr.addWidget(back)
+        hdr.addStretch()
+        hdr.addWidget(title)
+        hdr.addStretch()
+        hdr.addWidget(clr_btn)
+        hdr.addSpacing(8)
+        hdr.addWidget(sv)
+        root.addWidget(hdr_w)
+
+        # ── scrollable parameter dropdowns ───────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;}")
+        content = QWidget()
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(16, 12, 16, 12)
+        cl.setSpacing(8)
+
+        for key, label, _, freq, unit, color in _PARAM_TABLES:
+            tw = ParamTableWidget(label, color, freq, unit)
+            self._tables[key] = tw
+            cl.addWidget(tw)
+
+        cl.addStretch()
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+    def push_sensor_data(self, d):
+        """Called by TrackApp on every sensor tick to add rows to tables."""
+        for key, _, sensor_key, _, _, _ in _PARAM_TABLES:
+            if sensor_key in d and key in self._tables:
+                self._tables[key].push_value(d[sensor_key])
+
+    def _clear_all(self):
+        for tw in self._tables.values():
+            tw.clear_rows()
+
+    def get_data(self):
+        """Return dict with all table rows for each parameter."""
+        return {key: tw.get_rows() for key, tw in self._tables.items()}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CSV VIEWER PAGE
+# ═════════════════════════════════════════════════════════════════════════════
+class CSVViewerPage(QWidget):
+    sig_back = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._csv_dir = str(Path.home() / "surveys")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── header bar ───────────────────────────────────────────────────────
+        hdr_w = QWidget()
+        hdr_w.setFixedHeight(50)
+        hdr_w.setStyleSheet("background:#070707; border-bottom:1px solid #1a1a1a;")
+        hdr = QHBoxLayout(hdr_w)
+        hdr.setContentsMargins(10, 0, 10, 0)
+        hdr.setSpacing(8)
+
+        back = _btn("← DASHBOARD", "BC", 40, 170)
+        back.clicked.connect(self.sig_back)
+
+        title = QLabel("📋   CSV FILE VIEWER")
+        title.setStyleSheet(
+            f"color:{MAGI}; font-size:13pt; font-weight:bold; letter-spacing:3px;")
+
+        self._file_lbl = QLabel("No file loaded")
+        self._file_lbl.setStyleSheet("color:#444; font-size:8pt; font-family:'Courier New';")
+        self._file_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        browse_btn = _btn("📂  BROWSE", "BM", 40, 130)
+        browse_btn.clicked.connect(self._browse)
+
+        hdr.addWidget(back)
+        hdr.addSpacing(10)
+        hdr.addWidget(title)
+        hdr.addStretch()
+        hdr.addWidget(self._file_lbl, 1)
+        hdr.addSpacing(8)
+        hdr.addWidget(browse_btn)
+        root.addWidget(hdr_w)
+
+        # ── file list panel (left) + table (right) ───────────────────────────
+        body = QHBoxLayout()
+        body.setContentsMargins(8, 8, 8, 8)
+        body.setSpacing(8)
+
+        # left: list of CSV files in the current folder
+        left = QFrame(); left.setObjectName("Panel"); left.setFixedWidth(220)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(6, 6, 6, 6)
+        ll.setSpacing(5)
+
+        lbl = QLabel("SAVED FILES")
+        lbl.setStyleSheet(
+            f"color:{MAGI}; font-size:8pt; font-weight:bold; letter-spacing:2px;")
+        ll.addWidget(lbl)
+
+        self._file_scroll = QScrollArea()
+        self._file_scroll.setWidgetResizable(True)
+        self._file_scroll.setStyleSheet("QScrollArea{border:none; background:#050505;}")
+        self._file_list_widget = QWidget()
+        self._file_list_layout = QVBoxLayout(self._file_list_widget)
+        self._file_list_layout.setContentsMargins(2, 2, 2, 2)
+        self._file_list_layout.setSpacing(4)
+        self._file_list_layout.addStretch()
+        self._file_scroll.setWidget(self._file_list_widget)
+        ll.addWidget(self._file_scroll, 1)
+
+        refresh_btn = _btn("↺  REFRESH", "BX", 36)
+        refresh_btn.clicked.connect(self._refresh_list)
+        ll.addWidget(refresh_btn)
+
+        body.addWidget(left)
+
+        # right: table view
+        right = QFrame(); right.setObjectName("Panel")
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(6, 6, 6, 6)
+        rl.setSpacing(4)
+
+        # row count label
+        self._row_lbl = QLabel("")
+        self._row_lbl.setStyleSheet("color:#444; font-size:8pt; font-family:'Courier New';")
+        rl.addWidget(self._row_lbl)
+
+        self._table = QTableWidget()
+        self._table.setStyleSheet(
+            f"QTableWidget {{ background:#060606; color:#ccc;"
+            f" font-size:8pt; font-family:'Courier New';"
+            f" gridline-color:#1a1a1a; border:none; }}"
+            f"QHeaderView::section {{ background:#0c0c0c; color:{MAGI};"
+            f" font-size:8pt; font-weight:bold; border:1px solid #1a1a1a;"
+            f" padding:4px; }}"
+            f"QTableWidget::item:selected {{ background:{MAGI}33; color:#fff; }}"
+            f"QScrollBar:vertical {{ background:#0a0a0a; width:8px; }}"
+            f"QScrollBar::handle:vertical {{ background:#2a2a2a; border-radius:4px; }}"
+            f"QScrollBar:horizontal {{ background:#0a0a0a; height:8px; }}"
+            f"QScrollBar::handle:horizontal {{ background:#2a2a2a; border-radius:4px; }}"
+        )
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalHeader().setDefaultSectionSize(28)
+        self._table.verticalHeader().setStyleSheet(
+            "QHeaderView::section { background:#0c0c0c; color:#333;"
+            " font-size:7pt; border:1px solid #1a1a1a; }")
+        rl.addWidget(self._table, 1)
+
+        body.addWidget(right, 1)
+
+        root_body = QWidget()
+        root_body.setLayout(body)
+        root.addWidget(root_body, 1)
+
+    # ── public ────────────────────────────────────────────────────────────────
+    def set_csv_dir(self, path):
+        self._csv_dir = path
+        self._refresh_list()
+
+    def load_latest(self):
+        """Auto-load the most recently modified CSV in the folder."""
+        self._refresh_list()
+        files = sorted(Path(self._csv_dir).glob("*.csv"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            self._load_file(str(files[0]))
+
+    # ── internal ──────────────────────────────────────────────────────────────
+    def _refresh_list(self):
+        # clear old buttons
+        while self._file_list_layout.count() > 1:
+            item = self._file_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        files = sorted(Path(self._csv_dir).glob("*.csv"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in files:
+            btn = QPushButton(f.name)
+            btn.setObjectName("EF")
+            btn.setFixedHeight(44)
+            btn.setStyleSheet(
+                f"QPushButton{{background:#0a0a0a; border:1px solid #1e1e1e;"
+                f" border-radius:5px; color:{MAGI}; font-size:7pt;"
+                f" font-family:'Courier New'; text-align:left; padding-left:8px;}}"
+                f"QPushButton:pressed{{background:#140020; border-color:{MAGI};}}")
+            btn.clicked.connect(lambda _, p=str(f): self._load_file(p))
+            self._file_list_layout.insertWidget(
+                self._file_list_layout.count() - 1, btn)
+
+        if not files:
+            empty = QLabel("No CSV files found")
+            empty.setStyleSheet("color:#333; font-size:8pt; padding:8px;")
+            self._file_list_layout.insertWidget(0, empty)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open CSV File", self._csv_dir, "CSV Files (*.csv)")
+        if path:
+            self._load_file(path)
+
+    def _load_file(self, path):
+        try:
+            with open(path, newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                headers = reader.fieldnames or []
+
+            self._table.clear()
+            self._table.setRowCount(len(rows))
+            self._table.setColumnCount(len(headers))
+            self._table.setHorizontalHeaderLabels(headers)
+
+            for r, row in enumerate(rows):
+                for c, h in enumerate(headers):
+                    item = QTableWidgetItem(str(row.get(h, "")))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self._table.setItem(r, c, item)
+
+            name = Path(path).name
+            self._file_lbl.setText(name)
+            self._row_lbl.setText(
+                f"{len(rows)} rows  ·  {len(headers)} columns  ·  {name}")
+        except Exception as e:
+            self._row_lbl.setText(f"Error loading file: {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DASHBOARD PAGE
+# ═════════════════════════════════════════════════════════════════════════════
+_METRICS = [
+    ("gauge", "Track Gauge",  "mm",   NEON),
+    ("cross", "Cross Level",  "mm",   CYAN),
+    ("twist", "Twist",        "mm/m", AMBER),
+    ("dist",  "Distance",     "m",    MAGI),
+]
+
+
+class DashboardPage(QWidget):
+    sig_toggle = pyqtSignal(bool)
+    sig_pause  = pyqtSignal(bool)
+    sig_entry  = pyqtSignal()
+    sig_csv    = pyqtSignal()
+    sig_graph  = pyqtSignal(str)
+    sig_view   = pyqtSignal()        # open CSV viewer
+
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self._paused  = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(6)
+
+        grid = QGridLayout(); grid.setSpacing(8)
+        self._cards = {}
+        for i, (key, title, unit, color) in enumerate(_METRICS):
+            card = MetricCard(key, title, unit, color)
+            card.clicked.connect(self.sig_graph)
+            grid.addWidget(card, i // 2, i % 2)
+            self._cards[key] = card
+        lay.addLayout(grid, 1)
+
+        # bottom bar
+        bot = QHBoxLayout()
+        bot.setContentsMargins(0, 4, 0, 2)
+        bot.setSpacing(0)
+
+        self._csv_btn = QPushButton("📁  SELECT CSV FOLDER")
+        self._csv_btn.setObjectName("BC")
+        self._csv_btn.setFixedHeight(56)
+        self._csv_btn.setFixedWidth(235)
+        self._csv_btn.clicked.connect(self.sig_csv)
+
+        self._toggle = QPushButton("▶\nSTART")
+        self._toggle.setFixedSize(90, 90)
+        self._toggle.setStyleSheet(self._ss_start())
+        self._toggle.clicked.connect(self._do_toggle)
+
+        self._pause_btn = QPushButton("⏸\nPAUSE")
+        self._pause_btn.setFixedSize(90, 90)
+        self._pause_btn.setStyleSheet(self._ss_pause())
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.clicked.connect(self._do_pause)
+
+        self._view_btn = QPushButton("📋\nVIEW CSV")
+        self._view_btn.setObjectName("BM")
+        self._view_btn.setFixedSize(110, 78)
+        self._view_btn.clicked.connect(self.sig_view)
+
+        self._entry_btn = QPushButton("DATA\nENTRY")
+        self._entry_btn.setObjectName("BC")
+        self._entry_btn.setFixedSize(110, 78)
+        self._entry_btn.clicked.connect(self.sig_entry)
+
+        self._stat = QLabel("○  IDLE\n─")
+        self._stat.setStyleSheet(
+            "color:#222; font-size:8pt; font-family:'Courier New';")
+
+        bot.addWidget(self._csv_btn)
+        bot.addStretch()
+        bot.addWidget(self._toggle)
+        bot.addSpacing(12)
+        bot.addWidget(self._pause_btn)
+        bot.addSpacing(16)
+        bot.addWidget(self._entry_btn)
+        bot.addSpacing(10)
+        bot.addWidget(self._view_btn)
+        bot.addSpacing(14)
+        bot.addWidget(self._stat)
+        bot.addStretch()
+        lay.addLayout(bot)
+
+    def _ss_start(self):
+        return (f"QPushButton{{background:#002200; border:3px solid {NEON};"
+                f" border-radius:45px; color:{NEON}; font-size:12pt;"
+                f" font-weight:bold;}}"
+                f"QPushButton:pressed{{background:#003300;}}")
+
+    def _ss_stop(self):
+        return (f"QPushButton{{background:#220000; border:3px solid {RED};"
+                f" border-radius:45px; color:{RED}; font-size:12pt;"
+                f" font-weight:bold;}}"
+                f"QPushButton:pressed{{background:#330000;}}")
+
+    def _ss_pause(self):
+        return (f"QPushButton{{background:#1a1200; border:3px solid {AMBER};"
+                f" border-radius:45px; color:{AMBER}; font-size:12pt;"
+                f" font-weight:bold;}}"
+                f"QPushButton:pressed{{background:#261b00;}}"
+                f"QPushButton:disabled{{background:#0a0a0a; border-color:#2a2a2a; color:#2a2a2a;}}")
+
+    def _ss_resume(self):
+        return (f"QPushButton{{background:#001520; border:3px solid {CYAN};"
+                f" border-radius:45px; color:{CYAN}; font-size:12pt;"
+                f" font-weight:bold;}}"
+                f"QPushButton:pressed{{background:#002030;}}")
+
+    def _do_toggle(self):
+        self._running = not self._running
+        if self._running:
+            self._toggle.setText("■\nSTOP")
+            self._toggle.setStyleSheet(self._ss_stop())
+            self._entry_btn.setEnabled(False)
+            self._csv_btn.setEnabled(False)
+            self._pause_btn.setEnabled(True)
+            self._paused = False
+            self._pause_btn.setText("⏸\nPAUSE")
+            self._pause_btn.setStyleSheet(self._ss_pause())
+        else:
+            self._toggle.setText("▶\nSTART")
+            self._toggle.setStyleSheet(self._ss_start())
+            self._entry_btn.setEnabled(True)
+            self._csv_btn.setEnabled(True)
+            self._pause_btn.setEnabled(False)
+            self._paused = False
+            self._pause_btn.setText("⏸\nPAUSE")
+            self._pause_btn.setStyleSheet(self._ss_pause())
+        self.sig_toggle.emit(self._running)
+
+    def _do_pause(self):
+        self._paused = not self._paused
+        if self._paused:
+            self._pause_btn.setText("▶\nRESUME")
+            self._pause_btn.setStyleSheet(self._ss_resume())
+        else:
+            self._pause_btn.setText("⏸\nPAUSE")
+            self._pause_btn.setStyleSheet(self._ss_pause())
+        self.sig_pause.emit(self._paused)
+
+    def update_data(self, d):
+        for key, card in self._cards.items():
+            if key in d:
+                card.refresh(d[key])
+
+    def set_session(self, n, running, path=""):
+        col  = NEON if running else "#2a2a2a"
+        icon = "●  REC" if running else "○  IDLE"
+        fname = Path(path).name[-28:] if path else "─"
+        self._stat.setText(f"{icon}  {n} pts\n{fname}")
+        self._stat.setStyleSheet(
+            f"color:{col}; font-size:8pt; font-family:'Courier New';")
+
+    def set_csv_label(self, path):
+        self._csv_btn.setText("📁  " + _shorten(path, 22))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+#  — NO Qt.FramelessWindowHint (kills X11 mouse routing)
+#  — NO QApplication.setOverrideCursor(Qt.BlankCursor) (hides cursor)
+#  — showFullScreen() WITHOUT frameless flag = correct mouse delivery on Ubuntu
+# ═════════════════════════════════════════════════════════════════════════════
+SCREEN_W, SCREEN_H = 1024, 600
+
+
+class TrackApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.cfg        = load_cfg()
+        self.logger     = CSVLogger()            # kept for mark() and CSV viewer
+        self.csv_writer = CSVWriterThread(self)   # Thread 2: dedicated CSV logger
+        self.csv_writer.start()
+        self.history    = {k: [] for k, *_ in _METRICS}
+
+        self.setWindowTitle("Rail Inspection Unit v5.0")
+        self.setStyleSheet(SS)
+
+        # sensor thread
+        self.sensor = SensorThread(self.cfg)
+        self.sensor.data_ready.connect(self._on_data)
+        self.sensor.fault.connect(self._on_fault)
+        self.sensor.motion.connect(self._on_motion)
+        self.sensor.start()
+
+        # ── screen-off timer: 5 min of no encoder motion → blank screen ───────
+        self._SCREEN_TIMEOUT_MS = 5 * 60 * 1000   # 5 minutes
+        self._last_motion_time  = time.time()
+        self._screen_off        = False
+
+        self._screen_timer = QTimer(self)
+        self._screen_timer.setInterval(10_000)     # check every 10 s
+        self._screen_timer.timeout.connect(self._check_screen_timeout)
+        self._screen_timer.start()
+
+        # black overlay widget used to blank the screen
+        self._blank = QWidget(self)
+        self._blank.setStyleSheet("background:#000000;")
+        self._blank.hide()
+        self._blank.mousePressEvent = self._wake_screen
+
+        # network thread
+        self.net = NetThread(self.cfg)
+        self.net.status.connect(self._on_net)
+        self.net.start()
+
+        # root layout
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.topbar  = TopBar(self)
+        self.ctrlbar = ControlBar(self.cfg, self)
+        self.ctrlbar.sig_cal.connect(lambda: self._goto(1))
+        self.ctrlbar.sig_mark.connect(self._on_mark)
+
+        self.stack = QStackedWidget()
+
+        self.dash = DashboardPage()
+        self.dash.sig_toggle.connect(self._on_toggle)
+        self.dash.sig_pause.connect(self._on_pause)
+        self.dash.sig_entry.connect(lambda: self._goto(2))
+        self.dash.sig_csv.connect(self._pick_csv)
+        self.dash.sig_graph.connect(self._show_graph)
+        self.dash.sig_view.connect(self._show_csv_viewer)
+        self.stack.addWidget(self.dash)       # 0
+
+        self.cal = CalibrationPage(self.cfg)
+        self.cal.sig_back.connect(lambda: self._goto(0))
+        self.stack.addWidget(self.cal)        # 1
+
+        self.entry = DataEntryPage()
+        self.entry.sig_back.connect(lambda: self._goto(0))
+        self.stack.addWidget(self.entry)      # 2
+
+        self.graph_pg = GraphPage()
+        self.graph_pg.sig_back.connect(lambda: self._goto(0))
+        self.stack.addWidget(self.graph_pg)   # 3
+
+        self.csv_viewer = CSVViewerPage()
+        self.csv_viewer.sig_back.connect(lambda: self._goto(0))
+        self.csv_viewer.set_csv_dir(self.cfg["csv_dir"])
+        self.stack.addWidget(self.csv_viewer) # 4
+
+        root.addWidget(self.topbar)
+        root.addWidget(self.ctrlbar)
+        root.addWidget(self.stack, 1)
+
+        self.dash.set_csv_label(self.cfg["csv_dir"])
+
+        # ── WINDOW: fullscreen, WM-managed, mouse cursor VISIBLE ─────────────
+        if sys.platform.startswith("linux"):
+            self.showFullScreen()    # no FramelessWindowHint → cursor works
+        else:
+            self.resize(SCREEN_W, SCREEN_H)
+            self.show()
+
+    def _goto(self, idx):
+        self.stack.setCurrentIndex(idx)
+
+    def _on_data(self, d):
+        for key in self.history:
+            if key in d:
+                self.history[key].append(d[key])
+                if len(self.history[key]) > 10_000:
+                    self.history[key].pop(0)
+        self.dash.update_data(d)                      # GUI update (main thread)
+        if self.sensor.active:
+            self.entry.push_sensor_data(d)
+        self.csv_writer.enqueue(d)                    # Thread 2: non-blocking CSV write
+        self.logger.write(d)                          # legacy logger for mark()/viewer
+        self.dash.set_session(
+            self.csv_writer.count, self.sensor.active,
+            self.csv_writer.path or self.logger.path or "")
+
+    def _on_fault(self, msg):
+        self.topbar.push_error(f"Sensor: {msg}")
+
+    def _on_net(self, bars, cloud):
+        self.topbar.update_net(bars, cloud)
+
+    def _on_toggle(self, running):
+        self.sensor.active = running
+        if running:
+            self.logger.set_reference("", "")
+            self.logger.set_station("BLE")
+            self.csv_writer.set_reference("", "")
+            self.csv_writer.set_station("BLE")
+            self.sensor.reset()
+            self.history = {k: [] for k in self.history}
+            self.logger.start(self.cfg["csv_dir"], self.cfg.get("hl_sec", 30))
+            self.csv_writer.start_session(
+                self.cfg["csv_dir"], self.cfg.get("hl_sec", 30))
+        else:
+            self.logger.stop()
+            self.csv_writer.stop_session()
+
+    def _on_pause(self, paused):
+        # Pause: stop sensor data collection; Resume: restart it
+        self.sensor.active = not paused
+
+    def _on_motion(self, moving):
+        """Called every sensor tick; reset idle clock whenever encoder moves."""
+        if moving:
+            self._last_motion_time = time.time()
+            if self._screen_off:
+                self._wake_screen()
+
+    def _check_screen_timeout(self):
+        """Periodically check if encoder has been idle for 5 minutes."""
+        if self._screen_off:
+            return
+        idle_ms = (time.time() - self._last_motion_time) * 1000
+        if idle_ms >= self._SCREEN_TIMEOUT_MS:
+            self._blank_screen()
+
+    def _blank_screen(self):
+        """Cover the entire window with a black overlay."""
+        self._screen_off = True
+        self._blank.setGeometry(self.rect())
+        self._blank.raise_()
+        self._blank.show()
+
+    def _wake_screen(self, _event=None):
+        """Remove the black overlay and reset idle timer."""
+        self._screen_off       = False
+        self._last_motion_time = time.time()
+        self._blank.hide()
+
+    def resizeEvent(self, e):
+        """Keep blank overlay covering full window on resize."""
+        super().resizeEvent(e)
+        if self._screen_off:
+            self._blank.setGeometry(self.rect())
+
+    def _on_mark(self, sec):
+        self.cfg["hl_sec"] = sec
+        save_cfg(self.cfg)
+        self.logger.mark(sec)
+
+    def _show_csv_viewer(self):
+        self.csv_viewer.set_csv_dir(self.cfg["csv_dir"])
+        self.csv_viewer.load_latest()
+        self._goto(4)
+
+    def _pick_csv(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Select CSV Output Directory",
+            self.cfg["csv_dir"], QFileDialog.ShowDirsOnly)
+        if d:
+            self.cfg["csv_dir"] = d
+            save_cfg(self.cfg)
+            self.dash.set_csv_label(d)
+            self.ctrlbar.set_csv_path(d)
+            self.csv_viewer.set_csv_dir(d)
+
+    def _show_graph(self, key):
+        meta = {k: (t, u, c) for k, t, u, c in _METRICS}
+        if key not in meta:
+            return
+        title, unit, color = meta[key]
+        self.graph_pg.load(title, unit, list(self.history.get(key, [])), color)
+        self._goto(3)
+
+    def keyPressEvent(self, e):
+        # ESC exits fullscreen — useful for recovery / development
+        if e.key() == Qt.Key_Escape:
+            if self.isFullScreen():
+                self.showNormal()
+                self.resize(SCREEN_W, SCREEN_H)
+        super().keyPressEvent(e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Rail Inspection Unit")
+    app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    app.restoreOverrideCursor()      # guarantee cursor is never hidden
+    w = TrackApp()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
