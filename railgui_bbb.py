@@ -131,7 +131,7 @@ _DEF = {
     "hl_sec":    30,
     "server":    "8.8.8.8",
     "lte_iface": "eth1",
-    "encoder":   {"scale": 1.0,  "calibrated": False},
+    "encoder":   {"scale": 1.0,  "ppr": 20, "diam": 62.0, "calibrated": False},  # ppr=pulses/rev  diam=wheel_mm
     "adc":       {"zero": 2048,  "mpc": 0.0684, "calibrated": False},
     "incl":      {"offset": 0.0, "calibrated": False},
     "gnss":      {"ref_ch": 0.0, "calibrated": False},
@@ -163,38 +163,73 @@ def save_cfg(cfg):
 # ─────────────────────────────────────────────────────────────────────────────
 #  HARDWARE
 # ─────────────────────────────────────────────────────────────────────────────
-# ── BeagleBone Black — Direct wiring, no breadboard, no external supply ──────
+# ─────────────────────────────────────────────────────────────────────────────
+#  HARDWARE  —  BeagleBone Black, direct-wired, no breadboard, no ext. supply
+# ─────────────────────────────────────────────────────────────────────────────
 #
-# POWER (from BBB onboard — no external supply needed):
-#   P9.32  VDD_ADC  1.8V  →  ALL three pot VCC legs (twist 3 wires into one pin)
-#   P9.34  GNDA_ADC       →  Pot 1 GND  (analog ground — best for ADC accuracy)
-#   P9.1   DGND           →  Pot 2 GND  (digital ground, fine for prototype)
-#   P9.2   DGND           →  Pot 3 GND  (digital ground, fine for prototype)
+#  ┌─ TWO 10 kΩ POTS ────────────────────────────────────────────────────────┐
+#  │  POWER  (onboard BBB — no external supply)                              │
+#  │    P9.32  VDD_ADC 1.8 V  →  Pot1 VCC + Pot2 VCC  (twist 2 wires→1 pin) │
+#  │    P9.34  GNDA_ADC       →  Pot 1 GND  (true analog ground)             │
+#  │    P9.1   DGND           →  Pot 2 GND                                   │
+#  │  SIGNAL                                                                  │
+#  │    P9.39  AIN0  →  Pot 1 wiper  (TRS100  — gauge, mm)                  │
+#  │    P9.40  AIN1  →  Pot 2 wiper  (SCL3300 — cross-level, deg)            │
+#  └─────────────────────────────────────────────────────────────────────────┘
 #
-# SIGNAL (each wiper its own dedicated AIN pin — zero conflicts):
-#   P9.39  AIN0  →  Pot 1 wiper  (NovotechnikTRS-0100 — gauge)
-#   P9.40  AIN1  →  Pot 2 wiper  (Murata SCL3300-D01  — cross-level)
-#   P9.37  AIN2  →  Pot 3 wiper  (Chainage pot        — distance)
+#  ┌─ ROTARY ENCODER  (GND SW DT CLK VCC) ───────────────────────────────────┐
+#  │    P9.4   3.3 V digital  →  Encoder VCC  (separate from ADC P9.32)      │
+#  │    P9.45  DGND           →  Encoder GND  (dedicated — no pot conflict)  │
+#  │    P8.11  GPIO1_13 (#45) →  Encoder CLK                                 │
+#  │    P8.12  GPIO1_12 (#44) →  Encoder DT                                  │
+#  │    P8.14  GPIO0_26 (#26) →  Encoder SW   (push-button — zero/mark)      │
+#  │  GPIO numbers: P8.11=45  P8.12=44  P8.14=26                             │
+#  │  (bank×32 + bit: bank1×32+13=45, bank1×32+12=44, bank0×32+26=26)        │
+#  └─────────────────────────────────────────────────────────────────────────┘
 #
-# STEP 2 — Rotary encoder upgrade (zero conflict with above, different header):
-#   P8.12  eQEP2A  →  Encoder A phase
-#   P8.11  eQEP2B  →  Encoder B phase
-#   P9.3   3.3V    →  Encoder VCC  (digital rail, separate from ADC P9.32)
-#   P9.1   DGND    →  Encoder GND
-#
-# BBB ADC: 12-bit (0–4095), max input 1.8V — do NOT exceed P9.32 voltage
+#  TOTAL: 10 unique pins — ZERO CONFLICTS
 
-EQEP_PATH  = ("/sys/devices/platform/ocp/48304000.epwmss"
-              "/48304180.eqep/counter/count0/count")  # Step 2: encoder
+# BBB IIO ADC sysfs paths (12-bit, 0–4095, max 1.8 V)
+ADC_PATH   = "/sys/bus/iio/devices/iio:device0/in_voltage0_raw"  # AIN0 P9.39
+ADC_PATH_1 = "/sys/bus/iio/devices/iio:device0/in_voltage1_raw"  # AIN1 P9.40
 
-ADC_PATH   = "/sys/bus/iio/devices/iio:device0/in_voltage0_raw"  # AIN0 P9.39 — TRS100 gauge
-ADC_PATH_1 = "/sys/bus/iio/devices/iio:device0/in_voltage1_raw"  # AIN1 P9.40 — SCL3300 inclinometer
-ADC_PATH_2 = "/sys/bus/iio/devices/iio:device0/in_voltage2_raw"  # AIN2 P9.37 — chainage pot
+# Rotary encoder GPIO sysfs paths
+ENC_CLK_GPIO = 45  # P8.11  GPIO1_13
+ENC_DT_GPIO  = 44  # P8.12  GPIO1_12
+ENC_SW_GPIO  = 26  # P8.14  GPIO0_26
+_GPIO_BASE   = "/sys/class/gpio"
 
 SPI_DEV    = "/dev/spidev1.0"
 
-# HW mode: True when BBB IIO ADC sysfs node is present (pots wired and BBB booted)
-HW_SIM     = not os.path.exists(ADC_PATH)
+# Hardware available when BBB IIO ADC sysfs node is present
+HW_SIM = not os.path.exists(ADC_PATH)
+
+
+def _gpio_export(num):
+    """Export a GPIO pin via sysfs if not already exported."""
+    val_path = f"{_GPIO_BASE}/gpio{num}/value"
+    if not os.path.exists(val_path):
+        try:
+            with open(f"{_GPIO_BASE}/export", "w") as f:
+                f.write(str(num))
+            with open(f"{_GPIO_BASE}/gpio{num}/direction", "w") as f:
+                f.write("in")
+        except Exception:
+            pass
+
+
+def _gpio_read(num):
+    """Read a sysfs GPIO value; returns 1 or 0."""
+    try:
+        with open(f"{_GPIO_BASE}/gpio{num}/value") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 1  # default high (pull-up)
+
+
+# eQEP path kept for reference only (not used in this build)
+EQEP_PATH = ("/sys/devices/platform/ocp/48304000.epwmss"
+             "/48304180.eqep/counter/count0/count")
 
 
 def _sysfs(path, default="0"):
@@ -634,48 +669,146 @@ class PresetTiles(QWidget):
         return self._sel
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SENSOR THREAD  (Thread 1 — reads all three BBB ADC channels at 2 Hz)
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENCODER THREAD  — polls CLK/DT/SW via BBB sysfs GPIO at 1 ms intervals
 #
-#  Hardware path (HW_SIM = False, BBB ADC sysfs present):
-#    AIN0 P9.39  →  TRS100  pot  →  gauge mm
-#    AIN1 P9.40  →  SCL3300 pot  →  cross-level deg
-#    AIN2 P9.37  →  chainage pot →  distance m
+#  Pins (P8 header — zero conflict with P9 ADC cluster):
+#    CLK  P8.11  GPIO1_13  (#45)  — quadrature A phase
+#    DT   P8.12  GPIO1_12  (#44)  — quadrature B phase
+#    SW   P8.14  GPIO0_26  (#26)  — push-button (zero / mark)
+#    VCC  P9.4   3.3 V digital
+#    GND  P9.45  DGND
 #
-#  Sensor emulation formulas (validated, all in-range):
-#    gauge    = 1435 + (raw0 − GAUGE_ZERO) × GAUGE_MPC          [mm]
-#    cross    = (raw1 − 2048) / 2048 × 30.0 − offset            [deg, ±30°]
-#    chainage = raw2 / 4095 × 10000                             [m, 0–10 km]
-#    twist    = |cross_now − cross_prev| / 3.0                  [mm/m, 3 m chord]
+#  Distance = |count| / PPR × wheel_circumference_mm / 1000  (metres)
+#  PPR and wheel diameter set in cfg["encoder"]; calibrated in settings page.
+# ══════════════════════════════════════════════════════════════════════════════
+import threading as _threading
+
+
+class EncoderThread(QThread):
+    """Thread that polls rotary encoder GPIO and maintains distance counter."""
+    sw_pressed = pyqtSignal()   # emitted on SW falling edge (debounced)
+
+    # Encoder specs (overridden by calibration)
+    _DEFAULT_PPR   = 20      # pulses per revolution (common KY-040 = 20)
+    _WHEEL_DIAM_MM = 62.0    # trolley wheel diameter in mm
+    _DEBOUNCE_MS   = 50      # SW debounce window
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg         = cfg
+        self._lock       = _threading.Lock()
+        self._count      = 0      # signed pulse count
+        self._moving     = False
+        self._running    = True
+        self._last_sw    = 1      # pull-up: idle = high
+        self._sw_time    = 0.0
+
+    # ── public API ────────────────────────────────────────────────────────────
+    def distance_m(self):
+        """Current distance in metres (thread-safe)."""
+        ppr   = self.cfg["encoder"].get("ppr",   self._DEFAULT_PPR)
+        diam  = self.cfg["encoder"].get("diam",  self._WHEEL_DIAM_MM)
+        circ  = 3.14159265 * diam
+        with self._lock:
+            c = abs(self._count)
+        return round(c / max(1, ppr) * circ / 1000.0, 3)
+
+    def is_moving(self):
+        with self._lock:
+            return self._moving
+
+    def reset(self):
+        with self._lock:
+            self._count   = 0
+            self._moving  = False
+
+    def stop_thread(self):
+        self._running = False
+
+    # ── thread body ───────────────────────────────────────────────────────────
+    def run(self):
+        if HW_SIM:
+            self._run_sim()
+        else:
+            self._run_hw()
+
+    def _run_hw(self):
+        """Hardware mode: poll sysfs GPIO at 1 ms."""
+        for gpio in (ENC_CLK_GPIO, ENC_DT_GPIO, ENC_SW_GPIO):
+            _gpio_export(gpio)
+        last_clk = _gpio_read(ENC_CLK_GPIO)
+        while self._running:
+            clk = _gpio_read(ENC_CLK_GPIO)
+            dt  = _gpio_read(ENC_DT_GPIO)
+            sw  = _gpio_read(ENC_SW_GPIO)
+            # quadrature decode
+            if clk != last_clk:
+                with self._lock:
+                    if dt != clk:
+                        self._count += 1   # clockwise
+                    else:
+                        self._count -= 1   # counter-clockwise
+                    self._moving = True
+            else:
+                with self._lock:
+                    self._moving = False
+            last_clk = clk
+            # SW debounce (falling edge = press)
+            now = time.time()
+            if sw == 0 and self._last_sw == 1:
+                if (now - self._sw_time) * 1000 > self._DEBOUNCE_MS:
+                    self._sw_time = now
+                    self.sw_pressed.emit()
+            self._last_sw = sw
+            self.msleep(1)
+
+    def _run_sim(self):
+        """Simulation mode: accumulate counts at realistic trolley speed."""
+        import math
+        t = 0.0
+        while self._running:
+            t += 0.1
+            # simulate ~0.5 m/s trolley — one pulse every ~10 ms at 20 PPR
+            if int(t * 10) % 2 == 0:
+                with self._lock:
+                    self._count += 1
+                    self._moving = True
+            self.msleep(100)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SENSOR THREAD  (Thread 1)
 #
-# ── STEP 2: Replace chainage pot with rotary encoder ─────────────────────────
-#  When the encoder is wired to P8.12 (eQEP2A) and P8.11 (eQEP2B):
-#    1. Uncomment the _hw_encoder() method below
-#    2. In _hw(), replace self._hw_chainage_pot() with self._hw_encoder()
-#    3. Set cfg["encoder"]["scale"] in the calibration page (mm/count)
-#    4. Encoder VCC → P9.3 (3.3V digital rail, separate from ADC supply)
-# ═════════════════════════════════════════════════════════════════════════════
+#  Reads two BBB ADC channels at 2 Hz and queries EncoderThread for distance:
+#    AIN0 P9.39  →  TRS100  pot  →  gauge (mm)
+#    AIN1 P9.40  →  SCL3300 pot  →  cross-level (deg)
+#    EncoderThread         →  chainage (m)
+#
+#  Sensor emulation (validated):
+#    gauge    = 1435 + (raw0 − GAUGE_ZERO) × GAUGE_MPC       [mm]
+#    cross    = (raw1 − 2048) / 2048 × 30.0 − offset         [deg, ±30°]
+#    twist    = |cross_now − cross_prev| / 3.0                [mm/m, 3 m chord]
+# ══════════════════════════════════════════════════════════════════════════════
 class SensorThread(QThread):
     data_ready = pyqtSignal(dict)
     fault      = pyqtSignal(str)
     motion     = pyqtSignal(bool)
 
     # Validated sensor constants
-    _ADC_MAX     = 4095    # BBB 12-bit ADC full scale
-    _ADC_MID     = 2048    # mid-point = standard gauge / level
-    _GAUGE_STD   = 1435.0  # standard gauge mm
-    _GAUGE_MPC   = 0.04883 # mm/ADC-count (±100 mm over 2048 counts)
-    _INCL_FS     = 30.0    # SCL3300-D01 Mode-1 ±30° full scale
-    _CHAIN_MAX   = 10000.0 # pot full-sweep distance (metres)
-    _TWIST_CHORD = 3.0     # railway standard 3 m twist chord
+    _ADC_MID     = 2048
+    _GAUGE_STD   = 1435.0
+    _GAUGE_MPC   = 0.04883   # mm/count — ±100 mm over 2048 counts
+    _INCL_FS     = 30.0      # SCL3300-D01 Mode-1 ±30°
+    _TWIST_CHORD = 3.0       # railway standard 3 m chord
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, encoder: "EncoderThread"):
         super().__init__()
         self.cfg         = cfg
+        self._encoder    = encoder
         self.active      = False
         self._prev_cross = 0.0
         self._sim_dist   = 0.0
-        # self._lastc    = 0    # Step 2: uncomment when encoder replaces pot
 
     def run(self):
         while True:
@@ -687,9 +820,10 @@ class SensorThread(QThread):
                     self.fault.emit(str(e))
             self.msleep(500)
 
-    # ── HARDWARE: reads all three ADC channels directly ───────────────────────
+    # ── hardware read ─────────────────────────────────────────────────────────
     def _hw(self):
-        self.motion.emit(True)
+        moving = self._encoder.is_moving()
+        self.motion.emit(moving)
 
         # AIN0 P9.39 → TRS100 gauge pot
         zero  = self.cfg["adc"].get("zero", self._ADC_MID)
@@ -701,10 +835,10 @@ class SensorThread(QThread):
         raw1  = int(_sysfs(ADC_PATH_1, str(self._ADC_MID)))
         cross = self._adc_to_cross(raw1)
 
-        # AIN2 P9.37 → chainage pot (replace with _hw_encoder() in Step 2)
-        dist  = self._hw_chainage_pot()
+        # Encoder thread → distance
+        dist  = self._encoder.distance_m()
 
-        # Twist = |Δcross-level| / 3 m chord
+        # Twist = |Δcross| / 3 m chord
         twist = round(abs(cross - self._prev_cross) / self._TWIST_CHORD, 4)
         self._prev_cross = cross
 
@@ -719,45 +853,21 @@ class SensorThread(QThread):
         }
 
     def _adc_to_cross(self, raw):
-        """12-bit ADC → SCL3300-D01 cross-level degrees.
-        ADC=0 → -30°  |  ADC=2048 → 0°  |  ADC=4095 → +30°
-        Subtracts calibrated zero offset from cfg["incl"]["offset"]."""
+        """12-bit BBB ADC → SCL3300-D01 cross-level degrees.
+        ADC=0→-30°  |  ADC=2048→0°  |  ADC=4095→+30°
+        Offset subtracted from cfg["incl"]["offset"] (calibrated)."""
         offset = self.cfg["incl"].get("offset", 0.0)
         return round((raw - self._ADC_MID) / self._ADC_MID * self._INCL_FS - offset, 4)
 
-    def _hw_chainage_pot(self):
-        """AIN2 P9.37 → chainage pot → distance in metres.
-        Full sweep 0–4095 maps to 0–10 000 m.
-        Replace this method with _hw_encoder() in Step 2."""
-        raw = int(_sysfs(ADC_PATH_2, "0"))
-        return round(raw / self._ADC_MAX * self._CHAIN_MAX, 2)
-
-    # ── STEP 2: uncomment when rotary encoder replaces chainage pot ───────────
-    # def _hw_encoder(self):
-    #     """eQEP2 rotary encoder on P8.12/P8.11 → distance in metres.
-    #     Wiring: P8.12 eQEP2A, P8.11 eQEP2B, P9.3 VCC (3.3V), P9.1 GND.
-    #     Zero conflict with ADC pins — different header (P8 vs P9 ADC cluster).
-    #     Steps:
-    #       1. Wire encoder to P8.11/P8.12 (no existing ADC pins used)
-    #       2. Uncomment this method
-    #       3. In _hw() change: dist = self._hw_chainage_pot()
-    #                       to: dist = self._hw_encoder()
-    #       4. Calibrate scale in settings → cfg["encoder"]["scale"] mm/count
-    #     """
-    #     cnt          = int(_sysfs(EQEP_PATH, "0"))
-    #     delta        = cnt - self._lastc
-    #     self._lastc  = cnt
-    #     dist_mm      = getattr(self, "_enc_dist_mm", 0.0) + delta * self.cfg["encoder"]["scale"]
-    #     self._enc_dist_mm = dist_mm
-    #     self.motion.emit(delta != 0)
-    #     return round(dist_mm / 1000.0, 2)
-
-    # ── SIMULATION: realistic synthetic data for development ─────────────────
+    # ── simulation ────────────────────────────────────────────────────────────
     def _sim(self):
         import math
-        self._sim_dist  += 0.2
+        dist = self._encoder.distance_m()  # use encoder sim even in sensor sim
+        if dist == 0.0:                    # fallback if encoder not yet started
+            self._sim_dist += 0.2
+            dist = round(self._sim_dist, 1)
         self.motion.emit(True)
-        t     = self._sim_dist * 0.1
+        t     = dist * 0.1
         gauge = round(self._GAUGE_STD + random.gauss(0, 0.12), 2)
         cross = round(0.8 * math.sin(t) + random.gauss(0, 0.08), 4)
         twist = round(max(0.0, abs(cross - self._prev_cross) / self._TWIST_CHORD
@@ -767,16 +877,15 @@ class SensorThread(QThread):
             "gauge": gauge,
             "cross": cross,
             "twist": twist,
-            "dist":  round(self._sim_dist, 1),
-            "lat":   12.9716 + self._sim_dist * 1e-6,
-            "lon":   77.5946 + self._sim_dist * 1e-6,
+            "dist":  dist,
+            "lat":   12.9716 + dist * 1e-6,
+            "lon":   77.5946 + dist * 1e-6,
             "speed": round(random.uniform(2.0, 8.0), 1),
         }
 
     def reset(self):
-        self._prev_cross  = 0.0
-        self._sim_dist    = 0.0
-        # self._lastc     = 0    # Step 2: uncomment for encoder
+        self._prev_cross = 0.0
+        self._sim_dist   = 0.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -896,19 +1005,15 @@ class CSVLogger:
         self._f = self._w = None
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  CSV WRITER THREAD  (Thread 2)
-#
-#  Fully independent of GUI and sensor threads.
-#  Uses a bounded queue — enqueue() is non-blocking and never stalls the GUI.
-#  Each survey session writes to a timestamped CSV in cfg["csv_dir"].
-#  Includes "gauge" column in addition to the standard _FIELDS for traceability.
-# ═════════════════════════════════════════════════════════════════════════════
+#  Independent of GUI + sensor threads. Non-blocking queue; never stalls GUI.
+# ══════════════════════════════════════════════════════════════════════════════
 import queue as _queue
 
 
 class CSVWriterThread(QThread):
-    wrote = pyqtSignal(int)   # emits total row count after each write
+    wrote = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -921,7 +1026,6 @@ class CSVWriterThread(QThread):
         self._ref_value = ""
         self._station   = "BLE"
 
-    # ── Public API (safe to call from any thread) ─────────────────────────────
     def set_reference(self, ref_type, ref_value):
         self._ref_type  = ref_type
         self._ref_value = ref_value
@@ -930,7 +1034,6 @@ class CSVWriterThread(QThread):
         self._station = name.strip() if name else "UNKNOWN"
 
     def start_session(self, directory, hl_sec=30):
-        """Open a new timestamped CSV file for this survey session."""
         os.makedirs(directory, exist_ok=True)
         ts        = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename  = f"{self._station}_{ts}.csv"
@@ -939,47 +1042,36 @@ class CSVWriterThread(QThread):
         self._q.put({"_cmd": "open", "_path": self.path})
 
     def stop_session(self):
-        """Flush remaining rows and close the current file."""
         self._q.put({"_cmd": "close"})
 
     def enqueue(self, d):
-        """Non-blocking push — silently drops if queue is full.
-        Never blocks the GUI or sensor thread."""
         try:
             self._q.put_nowait(d)
         except _queue.Full:
             pass
 
-    # ── Thread body ───────────────────────────────────────────────────────────
     def run(self):
-        _EXTENDED = list(_FIELDS) + ["gauge"]
+        _EXT = list(_FIELDS) + ["gauge"]
         while True:
             try:
                 item = self._q.get(timeout=1.0)
             except _queue.Empty:
                 continue
-
             if isinstance(item, dict) and "_cmd" in item:
                 cmd = item["_cmd"]
                 if cmd == "open":
-                    if self._f:
-                        self._f.flush(); self._f.close()
+                    if self._f: self._f.flush(); self._f.close()
                     self._f = open(item["_path"], "w", newline="", buffering=1)
                     self._writer = csv.DictWriter(
-                        self._f, fieldnames=_EXTENDED, extrasaction="ignore")
+                        self._f, fieldnames=_EXT, extrasaction="ignore")
                     self._writer.writeheader()
-                    self._f.flush()
-                    self.count = 0
+                    self._f.flush(); self.count = 0
                 elif cmd in ("close", "stop"):
-                    if self._f:
-                        self._f.flush(); self._f.close()
-                        self._f = self._writer = None
-                    if cmd == "stop":
-                        break
+                    if self._f: self._f.flush(); self._f.close()
+                    self._f = self._writer = None
+                    if cmd == "stop": break
                 continue
-
-            if self._writer is None:
-                continue
+            if self._writer is None: continue
             cross = item.get("cross", 0)
             row = {
                 "epoch_time":       int(time.time()),
@@ -1000,7 +1092,7 @@ class CSVWriterThread(QThread):
                 self.count += 1
                 self.wrote.emit(self.count)
             except Exception as e:
-                print(f"[CSVWriterThread] write error: {e}")
+                print(f"[CSVWriterThread] {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2832,16 +2924,21 @@ class TrackApp(QWidget):
     def __init__(self):
         super().__init__()
         self.cfg        = load_cfg()
-        self.logger     = CSVLogger()            # kept for mark() and CSV viewer
-        self.csv_writer = CSVWriterThread(self)   # Thread 2: dedicated CSV logger
+        self.logger     = CSVLogger()           # retained for mark() / CSV viewer
+        # Thread 2: dedicated CSV writer
+        self.csv_writer = CSVWriterThread(self)
         self.csv_writer.start()
+        # Encoder thread: polls GPIO CLK/DT/SW at 1 ms
+        self.encoder    = EncoderThread(self.cfg, self)
+        self.encoder.sw_pressed.connect(self._on_enc_sw)
+        self.encoder.start()
         self.history    = {k: [] for k, *_ in _METRICS}
 
         self.setWindowTitle("Rail Inspection Unit v5.0")
         self.setStyleSheet(SS)
 
-        # sensor thread
-        self.sensor = SensorThread(self.cfg)
+        # sensor thread (Thread 1 — passes encoder reference for distance)
+        self.sensor = SensorThread(self.cfg, self.encoder)
         self.sensor.data_ready.connect(self._on_data)
         self.sensor.fault.connect(self._on_fault)
         self.sensor.motion.connect(self._on_motion)
@@ -2928,11 +3025,11 @@ class TrackApp(QWidget):
                 self.history[key].append(d[key])
                 if len(self.history[key]) > 10_000:
                     self.history[key].pop(0)
-        self.dash.update_data(d)                      # GUI update (main thread)
+        self.dash.update_data(d)            # GUI (main thread)
         if self.sensor.active:
             self.entry.push_sensor_data(d)
-        self.csv_writer.enqueue(d)                    # Thread 2: non-blocking CSV write
-        self.logger.write(d)                          # legacy logger for mark()/viewer
+        self.csv_writer.enqueue(d)          # Thread 2: non-blocking CSV write
+        self.logger.write(d)               # legacy logger for mark() / viewer
         self.dash.set_session(
             self.csv_writer.count, self.sensor.active,
             self.csv_writer.path or self.logger.path or "")
@@ -2950,6 +3047,7 @@ class TrackApp(QWidget):
             self.logger.set_station("BLE")
             self.csv_writer.set_reference("", "")
             self.csv_writer.set_station("BLE")
+            self.encoder.reset()              # zero distance on session start
             self.sensor.reset()
             self.history = {k: [] for k in self.history}
             self.logger.start(self.cfg["csv_dir"], self.cfg.get("hl_sec", 30))
@@ -2969,6 +3067,12 @@ class TrackApp(QWidget):
             self._last_motion_time = time.time()
             if self._screen_off:
                 self._wake_screen()
+
+    def _on_enc_sw(self):
+        """Encoder SW push-button: zero the distance counter during a session."""
+        if self.sensor.active:
+            self.encoder.reset()
+            self.topbar.push_error("Encoder zeroed by SW press")
 
     def _check_screen_timeout(self):
         """Periodically check if encoder has been idle for 5 minutes."""
