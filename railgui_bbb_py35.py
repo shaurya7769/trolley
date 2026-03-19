@@ -785,255 +785,289 @@ class EncoderThread(QThread):
 #    twist    = |cross_now - cross_prev| / 3.0                [mm/m, 3 m chord]
 # ==============================================================================
 class SensorThread(QThread):
+    """
+    Reads BBB hardware sensors at 2 Hz and emits data_ready every tick.
+    Emits ALWAYS (not just when active) so the dashboard shows live pot
+    and GPS values before a session is started.
+
+    Sensors:
+      AIN0 P9.39  TRS100 potentiometer  -> gauge mm  (Indian BG = 1676 mm)
+      AIN1 P9.40  SCL3300 pot           -> cross-level mm  (RDSO +/-150 mm)
+      /dev/ttyS4  u-blox NEO-M8P-2      -> lat, lon, speed_kmh
+      EncoderThread                     -> distance m
+    """
     data_ready = pyqtSignal(dict)
     fault      = pyqtSignal(str)
     motion     = pyqtSignal(bool)
 
-    # =========================================================================
-    # Indian Railways RDSO track geometry constants
-    # Reference: RDSO/SPN/TC/10 & Indian Railways Schedule of Dimensions 1676
-    # BG (Broad Gauge) standard = 1676 mm (India), NOT 1435 mm (standard gauge)
-    # =========================================================================
-    _ADC_MID      = 2048          # 12-bit ADC midpoint (0..4095)
-    _GAUGE_STD    = 1676.0        # INDIAN BG standard gauge mm (RDSO)
-    #
-    # TRS100 potentiometer range: +/-75 mm around standard (1601..1751 mm)
-    # Over 12-bit ADC: 4096 counts = 150 mm => 1 count = 0.03662 mm
-    # At midpoint (2048) => 1676 mm
-    _GAUGE_MPC    = 0.03662       # mm per ADC count  (150 mm / 4096 counts)
-    #
-    # SCL3300-D01 inclinometer: Mode 1 = +/-30 deg full scale
-    # Cross-level expressed in mm per metre (1 deg ~ 17.45 mm/m)
-    # RDSO alarm: cross-level > 75 mm (B-speed) / 65 mm (A-speed)
-    _INCL_FS      = 30.0          # SCL3300 full-scale degrees
-    _DEG_TO_MM    = 17.453        # 1 degree tilt = 17.453 mm over 1000 mm gauge
-    #
-    # Twist: RDSO chord = 3.5 m (cat-B alarm: 13 mm)
-    _TWIST_CHORD  = 3.5           # metres
-    #
-    _ADC_DEADBAND = 3             # ADC counts below which we treat as noise
+    # ---- RDSO Indian BG constants -------------------------------------------
+    _ADC_MID     = 2048          # 12-bit midpoint
+    _GAUGE_STD   = 1676.0        # Indian BG standard gauge (mm)
+    # TRS100 pot: centre=1676 mm, range 1601-1751 mm (+/-75 mm)
+    # 150 mm over 4096 counts = 0.036621 mm/count
+    _GAUGE_MPC   = 0.036621
+    # SCL3300 Mode-1: +/-30 deg full scale
+    _INCL_FS     = 30.0
+    # 1 deg tilt over 1676 mm base = 17.453 mm cross-level
+    _DEG_TO_MM   = 17.453
+    # RDSO 3.5 m chord for twist measurement
+    _TWIST_CHORD = 3.5
+    # ADC noise deadband: ignore changes < 3 counts (~0.1 mm)
+    _DEADBAND    = 3
 
     def __init__(self, cfg, encoder):
         super().__init__()
-        self.cfg          = cfg
-        self._encoder     = encoder
-        self.active       = False
+        self.cfg            = cfg
+        self._encoder       = encoder
+        self.active         = False        # True = session running -> write CSV
         self._prev_cross_mm = 0.0
 
-        # Per-sensor hardware presence flags (checked once at init)
-        self._adc0_ok  = os.path.exists(ADC_PATH)    # gauge pot
-        self._adc1_ok  = os.path.exists(ADC_PATH_1)  # inclinometer pot
-        self._gps_ok   = os.path.exists("/dev/ttyS4") # u-blox NEO-M8P-2
+        # Check hardware presence once at init
+        self._has_adc0 = os.path.exists(ADC_PATH)    # gauge pot AIN0
+        self._has_adc1 = os.path.exists(ADC_PATH_1)  # incl pot  AIN1
+        self._has_gps  = os.path.exists("/dev/ttyS4") # u-blox UART
 
-        # Last stable ADC raw readings (initialised to midpoint = standard values)
-        self._last_raw0  = self._ADC_MID
-        self._last_raw1  = self._ADC_MID
-        self._last_gauge = self._GAUGE_STD   # mm
-        self._last_cross = 0.0               # mm (cross-level in mm, not degrees)
+        # ADC state: initialise to midpoint so gauge shows 1676.0 at startup
+        self._raw0       = self._ADC_MID   # last stable gauge ADC count
+        self._raw1       = self._ADC_MID   # last stable incl  ADC count
+        self._gauge_mm   = self._GAUGE_STD
+        self._cross_mm   = 0.0
 
-        # GPS state -- persists between polls (holds last valid fix)
+        # GPS state: hold last valid fix
         self._lat        = 0.0
         self._lon        = 0.0
         self._speed_kmh  = 0.0
-        self._gps_serial = None
-        self._gps_buf    = ""
+        self._gps_ser    = None   # pyserial Serial object when open
+        self._gps_buf    = ""     # partial NMEA line buffer
 
-        # Open GPS serial port once if available
-        if self._gps_ok:
-            try:
-                import serial as _serial
-                self._gps_serial = _serial.Serial(
-                    "/dev/ttyS4", baudrate=9600, timeout=0.5)
-            except Exception:
-                self._gps_ok = False
-
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def run(self):
-        while True:
-            if self.active:
-                try:
-                    d = self._read_all()
-                    self.data_ready.emit(d)
-                except Exception as e:
-                    self.fault.emit(str(e))
-            self.msleep(500)   # 2 Hz sample rate
+        # Open GPS serial once before entering the loop
+        self._open_gps()
 
-    # -------------------------------------------------------------------------
-    def _read_all(self):
+        while True:
+            try:
+                d = self._sample()
+                self.data_ready.emit(d)
+            except Exception as exc:
+                self.fault.emit(str(exc))
+            self.msleep(500)    # 2 Hz
+
+    # =========================================================================
+    def _sample(self):
+        """Read all sensors and return a data dict."""
         moving = self._encoder.is_moving()
         self.motion.emit(moving)
-        dist   = self._encoder.distance_m()
+        dist = self._encoder.distance_m()
 
-        gauge    = self._read_gauge()
-        cross_mm = self._read_cross_mm()
+        self._update_gauge()
+        self._update_cross()
+        self._update_gps()
 
-        # Twist = change in cross-level (mm) over RDSO 3.5 m chord
+        twist = 0.0
         if moving:
-            twist = round(abs(cross_mm - self._prev_cross_mm) / self._TWIST_CHORD, 3)
-        else:
-            twist = 0.0
-        self._prev_cross_mm = cross_mm
-
-        self._read_gps()
+            twist = round(
+                abs(self._cross_mm - self._prev_cross_mm) / self._TWIST_CHORD, 3)
+        self._prev_cross_mm = self._cross_mm
 
         return {
-            "gauge": gauge,          # mm, BG standard 1676
-            "cross": cross_mm,       # mm cross-level (RDSO)
-            "twist": twist,          # mm/m over 3.5 m chord
-            "dist":  dist,           # m chainage
-            "lat":   self._lat,      # decimal degrees
-            "lon":   self._lon,      # decimal degrees
+            "gauge": self._gauge_mm,
+            "cross": self._cross_mm,
+            "twist": twist,
+            "dist" : dist,
+            "lat"  : self._lat,
+            "lon"  : self._lon,
             "speed": self._speed_kmh,
         }
 
     # =========================================================================
-    # GAUGE -- TRS100 potentiometer on AIN0 (P9.39)
-    # Formula: gauge_mm = GAUGE_STD + (raw - ADC_MID) * MPC
-    # At ADC=2048 => 1676 mm (standard BG)
-    # At ADC=0    => 1676 - 2048*0.03662 = 1676 - 75 = 1601 mm
-    # At ADC=4095 => 1676 + 2047*0.03662 = 1676 + 75 = 1751 mm
+    # GAUGE  -- TRS100 pot on AIN0 / P9.39
     # =========================================================================
-    def _read_gauge(self):
+    def _update_gauge(self):
+        if self._has_adc0:
+            # Real hardware: read BBB IIO sysfs directly
+            try:
+                with open(ADC_PATH, "r") as fh:
+                    raw = int(fh.read().strip())
+            except Exception:
+                return   # keep last good value
+        else:
+            # No ADC hardware -- hold current value, do not simulate
+            return
+
+        # Apply deadband filter
+        if abs(raw - self._raw0) < self._DEADBAND:
+            return   # pot hasn't moved enough -- hold last value
+
+        self._raw0 = raw
+
+        # Use calibrated zero and mpc if available, else class defaults
         zero = self.cfg["adc"].get("zero", self._ADC_MID)
         mpc  = self.cfg["adc"].get("mpc",  self._GAUGE_MPC)
 
-        if self._adc0_ok:
+        gauge = self._GAUGE_STD + (raw - zero) * mpc
+        # Physical clamp: BG tolerance +/-75 mm around 1676 mm
+        gauge = max(1601.0, min(1751.0, gauge))
+        self._gauge_mm = round(gauge, 1)
+
+    # =========================================================================
+    # CROSS-LEVEL  -- SCL3300 pot on AIN1 / P9.40
+    # ADC=0    -> -30 deg  -> -523 mm (clamped to -150 mm)
+    # ADC=2048 ->   0 deg  ->    0 mm
+    # ADC=4095 -> +30 deg  -> +523 mm (clamped to +150 mm)
+    # =========================================================================
+    def _update_cross(self):
+        if self._has_adc1:
             try:
-                raw = int(_sysfs(ADC_PATH, str(self._last_raw0)))
+                with open(ADC_PATH_1, "r") as fh:
+                    raw = int(fh.read().strip())
             except Exception:
-                raw = self._last_raw0
+                return
         else:
-            # No hardware: hold at standard gauge (pot at centre = 1676 mm)
-            raw = self._last_raw0
+            return
 
-        # Deadband filter: only update if pot moved meaningfully
-        if abs(raw - self._last_raw0) >= self._ADC_DEADBAND:
-            self._last_raw0 = raw
-            gauge = self._GAUGE_STD + (raw - zero) * mpc
-            # Physical clamp: Indian BG range 1601-1751 mm (+/-75 mm tolerance)
-            gauge = max(1601.0, min(1751.0, gauge))
-            self._last_gauge = round(gauge, 1)
+        if abs(raw - self._raw1) < self._DEADBAND:
+            return
 
-        return self._last_gauge
+        self._raw1 = raw
 
-    # =========================================================================
-    # CROSS-LEVEL -- SCL3300 inclinometer pot on AIN1 (P9.40)
-    # ADC 0..4095 maps to -30..+30 degrees
-    # Cross-level in mm = angle_deg * DEG_TO_MM
-    # RDSO limits: warn > 50 mm, alarm > 75 mm
-    # =========================================================================
-    def _read_cross_mm(self):
         offset_deg = self.cfg["incl"].get("offset", 0.0)
+        angle_deg  = (raw - self._ADC_MID) / float(self._ADC_MID) * self._INCL_FS
+        angle_deg -= offset_deg
+        cross_mm   = angle_deg * self._DEG_TO_MM
+        cross_mm   = max(-150.0, min(150.0, cross_mm))
+        self._cross_mm = round(cross_mm, 2)
 
-        if self._adc1_ok:
+    # =========================================================================
+    # GPS  -- u-blox NEO-M8P-2 on /dev/ttyS4 at 9600 baud
+    # Opens serial once, reads buffered NMEA bytes each tick.
+    # Falls back to gpsd TCP socket if pyserial unavailable.
+    # Lat/lon/speed held at last valid fix once acquired.
+    # =========================================================================
+    def _open_gps(self):
+        """Open serial port once. Silent on any error."""
+        if not self._has_gps:
+            return
+        try:
+            import serial as _s
+            self._gps_ser = _s.Serial(
+                port="/dev/ttyS4", baudrate=9600,
+                bytesize=8, parity="N", stopbits=1, timeout=0.1)
+        except Exception:
+            self._gps_ser = None
+
+    def _update_gps(self):
+        if self._gps_ser is not None:
+            # -- direct serial read ------------------------------------------
             try:
-                raw = int(_sysfs(ADC_PATH_1, str(self._last_raw1)))
+                waiting = self._gps_ser.in_waiting
+                if waiting > 0:
+                    chunk = self._gps_ser.read(waiting).decode("ascii", errors="replace")
+                    self._gps_buf += chunk
+                    while "\n" in self._gps_buf:
+                        line, self._gps_buf = self._gps_buf.split("\n", 1)
+                        self._nmea(line.strip())
             except Exception:
-                raw = self._last_raw1
+                pass
         else:
-            raw = self._last_raw1
+            # -- gpsd TCP fallback (port 2947) --------------------------------
+            self._gpsd_poll()
 
-        if abs(raw - self._last_raw1) >= self._ADC_DEADBAND:
-            self._last_raw1 = raw
-            # Convert ADC to degrees
-            angle_deg = (raw - self._ADC_MID) / float(self._ADC_MID) * self._INCL_FS
-            # Apply calibration offset
-            angle_deg -= offset_deg
-            # Convert degrees to mm cross-level (over 1676 mm gauge)
-            cross_mm = angle_deg * self._DEG_TO_MM
-            # Clamp to RDSO measurable range +/-150 mm
-            cross_mm = max(-150.0, min(150.0, cross_mm))
-            self._last_cross = round(cross_mm, 2)
-
-        return self._last_cross
-
-    # =========================================================================
-    # GPS -- u-blox NEO-M8P-2 on /dev/ttyS4 at 9600 baud
-    # Reads NMEA sentences directly from serial port.
-    # If serial not available, tries gpspipe as fallback.
-    # Holds last valid fix indefinitely.
-    # =========================================================================
-    def _read_gps(self):
-        if self._gps_serial is not None:
-            self._read_gps_serial()
-        else:
-            self._read_gps_pipe()
-
-    def _read_gps_serial(self):
-        """Read NMEA directly from /dev/ttyS4 (u-blox NEO-M8P-2)."""
+    def _gpsd_poll(self):
+        """Try to get one NMEA sentence from gpsd TCP port 2947."""
         try:
-            # Read all available bytes non-blocking
-            waiting = self._gps_serial.in_waiting
-            if waiting > 0:
-                chunk = self._gps_serial.read(waiting).decode("ascii", errors="replace")
-                self._gps_buf += chunk
-                # Process complete sentences
-                while "\n" in self._gps_buf:
-                    line, self._gps_buf = self._gps_buf.split("\n", 1)
-                    self._parse_nmea(line.strip())
+            import socket as _sock
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(0.4)
+            s.connect(("127.0.0.1", 2947))
+            s.sendall(b"?WATCH={\"enable\":true,\"nmea\":true};\n")
+            buf = b""
+            for _ in range(10):
+                try:
+                    buf += s.recv(1024)
+                    if b"\n" in buf:
+                        break
+                except Exception:
+                    break
+            s.close()
+            for line in buf.decode("ascii", errors="replace").splitlines():
+                if line.startswith("$"):
+                    self._nmea(line.strip())
         except Exception:
             pass
 
-    def _read_gps_pipe(self):
-        """Fallback: use gpspipe if gpsd is running."""
+    def _nmea(self, sentence):
+        """
+        Parse a single NMEA sentence.
+        Handles $GPGGA, $GNGGA, $GPRMC, $GNRMC.
+        """
         try:
-            r = subprocess.run(
-                ["gpspipe", "-r", "-n", "8"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=1
-            )
-            for line in r.stdout.decode("ascii", errors="replace").splitlines():
-                self._parse_nmea(line.strip())
-        except Exception:
-            pass
-
-    def _parse_nmea(self, sentence):
-        """Parse NMEA GGA and RMC sentences."""
-        try:
-            # Strip NMEA checksum if present
+            # Strip checksum
             if "*" in sentence:
-                sentence = sentence[:sentence.index("*")]
+                sentence = sentence[:sentence.rindex("*")]
+            sentence = sentence.strip()
+            if not sentence.startswith("$"):
+                return
             parts = sentence.split(",")
-            if len(parts) < 2:
+            if len(parts) < 6:
                 return
             tag = parts[0].upper()
 
-            # GGA: Global Positioning Fix
+            # GGA -- position and fix quality
             if "GGA" in tag and len(parts) >= 10:
-                fix_q = int(parts[6]) if parts[6].isdigit() else 0
+                fix_q = int(parts[6]) if parts[6].strip().isdigit() else 0
                 if fix_q >= 1 and parts[2] and parts[4]:
-                    lat_raw = parts[2]
-                    lon_raw = parts[4]
-                    lat_dir = parts[3]
-                    lon_dir = parts[5]
-                    # NMEA format: DDMM.MMMMM (lat) / DDDMM.MMMMM (lon)
-                    lat_d = float(lat_raw[:2])
-                    lat_m = float(lat_raw[2:])
-                    lon_d = float(lon_raw[:3])
-                    lon_m = float(lon_raw[3:])
-                    self._lat = lat_d + lat_m / 60.0
-                    self._lon = lon_d + lon_m / 60.0
-                    if lat_dir == "S":
-                        self._lat = -self._lat
-                    if lon_dir == "W":
-                        self._lon = -self._lon
+                    lat = self._nmea_deg(parts[2], parts[3])
+                    lon = self._nmea_deg(parts[4], parts[5])
+                    if lat != 0.0 or lon != 0.0:
+                        self._lat = lat
+                        self._lon = lon
 
-            # RMC: Recommended Minimum (includes speed)
+            # RMC -- active fix with speed
             elif "RMC" in tag and len(parts) >= 8:
-                status = parts[2].upper()
-                if status == "A" and parts[7]:   # A = active (valid fix)
-                    spd_knots = float(parts[7])
-                    self._speed_kmh = round(spd_knots * 1.852, 1)
+                if parts[2].upper() == "A":
+                    if parts[3] and parts[5]:
+                        lat = self._nmea_deg(parts[3], parts[4])
+                        lon = self._nmea_deg(parts[5], parts[6])
+                        if lat != 0.0 or lon != 0.0:
+                            self._lat = lat
+                            self._lon = lon
+                    if parts[7].strip():
+                        self._speed_kmh = round(float(parts[7]) * 1.852, 1)
         except Exception:
             pass
 
-    # -------------------------------------------------------------------------
-    def reset(self):
-        self._prev_cross_mm = 0.0
-        # Keep pot readings at current position (do not reset to midpoint)
-        # Only reset the twist accumulator
+    @staticmethod
+    def _nmea_deg(raw, direction):
+        """
+        Convert NMEA DDDMM.MMMMM to decimal degrees.
+        Lat:  DDMM.MMMMM  (2 degree digits)
+        Lon: DDDMM.MMMMM  (3 degree digits)
+        """
+        try:
+            raw = raw.strip()
+            if not raw or "." not in raw:
+                return 0.0
+            dot_pos = raw.index(".")
+            # degrees = all chars except last 2 before decimal
+            d_chars = dot_pos - 2
+            if d_chars < 1:
+                return 0.0
+            deg  = float(raw[:d_chars])
+            mins = float(raw[d_chars:])
+            dec  = deg + mins / 60.0
+            if direction.upper() in ("S", "W"):
+                dec = -dec
+            return round(dec, 7)
+        except Exception:
+            return 0.0
 
+    # =========================================================================
+    def reset(self):
+        """Called on session start. Only resets twist accumulator."""
+        self._prev_cross_mm = 0.0
+        # NOTE: do NOT reset _raw0/_raw1 -- keep current pot positions
+        # NOTE: do NOT reset GPS -- hold last fix across sessions
 
 
 # =============================================================================
@@ -3196,16 +3230,20 @@ class TrackApp(QWidget):
         self.stack.setCurrentIndex(idx)
 
     def _on_data(self, d):
+        # Always update history and dashboard (live readings before session)
         for key in self.history:
             if key in d:
                 self.history[key].append(d[key])
                 if len(self.history[key]) > 10000:
                     self.history[key].pop(0)
-        self.dash.update_data(d)            # GUI (main thread)
+        self.dash.update_data(d)
+
+        # Only write to CSV and data entry table when a session is active
         if self.sensor.active:
             self.entry.push_sensor_data(d)
-        self.csv_writer.enqueue(d)          # Thread 2: non-blocking CSV write
-        self.logger.write(d)               # legacy logger for mark() / viewer
+            self.csv_writer.enqueue(d)
+            self.logger.write(d)
+
         self.dash.set_session(
             self.csv_writer.count, self.sensor.active,
             self.csv_writer.path or self.logger.path or "")
