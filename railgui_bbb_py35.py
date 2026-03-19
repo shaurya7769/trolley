@@ -2849,29 +2849,38 @@ class DashboardPage(QWidget):
         lay.addLayout(bot)
 
     def _ss_start(self):
-        return ("QPushButton{{background:#002200; border:3px solid {};".format(NEON)
-                (" border-radius:45px; color:{}; font-size:12pt;"
-                 " font-weight:bold;}}"
-                 "QPushButton:pressed{{background:#003300;}}").format(NEON))
+        return (
+            "QPushButton{{background:#002200; border:3px solid {c};"
+            " border-radius:45px; color:{c}; font-size:12pt;"
+            " font-weight:bold;}}"
+            "QPushButton:pressed{{background:#003300;}}"
+        ).format(c=NEON)
 
     def _ss_stop(self):
-        return ("QPushButton{{background:#220000; border:3px solid {};".format(RED)
-                (" border-radius:45px; color:{}; font-size:12pt;"
-                 " font-weight:bold;}}"
-                 "QPushButton:pressed{{background:#330000;}}").format(RED))
+        return (
+            "QPushButton{{background:#220000; border:3px solid {c};"
+            " border-radius:45px; color:{c}; font-size:12pt;"
+            " font-weight:bold;}}"
+            "QPushButton:pressed{{background:#330000;}}"
+        ).format(c=RED)
 
     def _ss_pause(self):
-        return ("QPushButton{{background:#1a1200; border:3px solid {};".format(AMBER)
-                (" border-radius:45px; color:{}; font-size:12pt;"
-                 " font-weight:bold;}}"
-                 "QPushButton:pressed{{background:#261b00;}}"
-                 "QPushButton:disabled{{background:#0a0a0a; border-color:#2a2a2a; color:#2a2a2a;}}").format(AMBER))
+        return (
+            "QPushButton{{background:#1a1200; border:3px solid {c};"
+            " border-radius:45px; color:{c}; font-size:12pt;"
+            " font-weight:bold;}}"
+            "QPushButton:pressed{{background:#261b00;}}"
+            "QPushButton:disabled{{background:#0a0a0a;"
+            " border:3px solid #2a2a2a; color:#2a2a2a;}}"
+        ).format(c=AMBER)
 
     def _ss_resume(self):
-        return ("QPushButton{{background:#001520; border:3px solid {};".format(CYAN)
-                (" border-radius:45px; color:{}; font-size:12pt;"
-                 " font-weight:bold;}}"
-                 "QPushButton:pressed{{background:#002030;}}").format(CYAN))
+        return (
+            "QPushButton{{background:#001520; border:3px solid {c};"
+            " border-radius:45px; color:{c}; font-size:12pt;"
+            " font-weight:bold;}}"
+            "QPushButton:pressed{{background:#002030;}}"
+        ).format(c=CYAN)
 
     def _do_toggle(self):
         self._running = not self._running
