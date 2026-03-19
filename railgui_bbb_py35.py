@@ -764,16 +764,10 @@ class EncoderThread(QThread):
             self.msleep(1)
 
     def _run_sim(self):
-        """Simulation mode: accumulate counts at realistic trolley speed."""
-        import math
-        t = 0.0
+        """Simulation: encoder holds position. No random movement."""
         while self._running:
-            t += 0.1
-            # simulate ~0.5 m/s trolley -- one pulse every ~10 ms at 20 PPR
-            if int(t * 10) % 2 == 0:
-                with self._lock:
-                    self._count += 1
-                    self._moving = True
+            with self._lock:
+                self._moving = False
             self.msleep(100)
 
 
@@ -795,98 +789,181 @@ class SensorThread(QThread):
     fault      = pyqtSignal(str)
     motion     = pyqtSignal(bool)
 
-    # Validated sensor constants
+    # -- Indian Railways track geometry standards (RDSO) -----------------------
+    # Gauge  : BG standard 1435 mm, tolerance +6/-3 mm (tight track)
+    # Cross-level: alarm > 50 mm over 1 m (RDSO/SPN/TC/10)
+    # Twist  : alarm > 4.5 mm/m over 3.5 m chord (RDSO cat-B)
     _ADC_MID     = 2048
-    _GAUGE_STD   = 1435.0
-    _GAUGE_MPC   = 0.04883   # mm/count -- +/-100 mm over 2048 counts
-    _INCL_FS     = 30.0      # SCL3300-D01 Mode-1 +/-30deg
-    _TWIST_CHORD = 3.0       # railway standard 3 m chord
+    _GAUGE_STD   = 1435.0          # BG standard gauge mm
+    _GAUGE_MPC   = 0.04883         # mm/count  (+/-100 mm over 2048 counts)
+    _INCL_FS     = 30.0            # SCL3300-D01 Mode-1 full-scale deg
+    _TWIST_CHORD = 3.5             # RDSO standard chord length m
+    _ADC_DEADBAND = 4              # ADC counts -- ignore noise < 4 counts
+    _GAUGE_NOISE  = 0.05           # mm  -- instrument noise floor
+    _CROSS_NOISE  = 0.005          # deg -- instrument noise floor
 
     def __init__(self, cfg, encoder):
         # encoder: EncoderThread instance
         super().__init__()
-        self.cfg         = cfg
-        self._encoder    = encoder
-        self.active      = False
-        self._prev_cross = 0.0
-        self._sim_dist   = 0.0
+        self.cfg          = cfg
+        self._encoder     = encoder
+        self.active       = False
+        self._prev_cross  = 0.0
+        self._sim_dist    = 0.0
+
+        # Last stable ADC readings -- only update when pot actually moves
+        self._last_raw0   = self._ADC_MID   # gauge pot last reading
+        self._last_raw1   = self._ADC_MID   # inclinometer pot last reading
+        self._last_gauge  = self._GAUGE_STD  # last emitted gauge value
+        self._last_cross  = 0.0             # last emitted cross-level value
+
+        # GPS state -- holds last valid fix
+        self._lat         = 0.0
+        self._lon         = 0.0
+        self._speed       = 0.0
+        self._gps_ok      = False
 
     def run(self):
         while True:
             if self.active:
                 try:
-                    d = self._sim() if HW_SIM else self._hw()
+                    d = self._read()
                     self.data_ready.emit(d)
                 except Exception as e:
                     self.fault.emit(str(e))
             self.msleep(500)
 
-    # -- hardware read ---------------------------------------------------------
-    def _hw(self):
+    # -- unified read: real HW when ADC present, pot-sim otherwise -------------
+    def _read(self):
         moving = self._encoder.is_moving()
         self.motion.emit(moving)
+        dist   = self._encoder.distance_m()
 
-        # AIN0 P9.39 -> TRS100 gauge pot
-        zero  = self.cfg["adc"].get("zero", self._ADC_MID)
-        mpc   = self.cfg["adc"].get("mpc",  self._GAUGE_MPC)
-        raw0  = int(_sysfs(ADC_PATH, str(zero)))
-        gauge = self._GAUGE_STD + (raw0 - zero) * mpc
+        # -- GAUGE (AIN0 / P9.39 / TRS100 pot) --------------------------------
+        gauge = self._read_gauge()
 
-        # AIN1 P9.40 -> SCL3300 inclinometer pot
-        raw1  = int(_sysfs(ADC_PATH_1, str(self._ADC_MID)))
-        cross = self._adc_to_cross(raw1)
+        # -- CROSS-LEVEL (AIN1 / P9.40 / SCL3300 pot) -------------------------
+        cross = self._read_cross()
 
-        # Encoder thread -> distance
-        dist  = self._encoder.distance_m()
-
-        # Twist = |-cross| / 3 m chord
-        twist = round(abs(cross - self._prev_cross) / self._TWIST_CHORD, 4)
+        # -- TWIST: change in cross-level over RDSO 3.5 m chord ---------------
+        # Only meaningful when trolley is moving
+        if moving or not HW_SIM:
+            twist = round(
+                abs(cross - self._prev_cross) / self._TWIST_CHORD, 4)
+        else:
+            twist = 0.0
         self._prev_cross = cross
 
-        return {
-            "gauge": round(gauge, 2),
-            "cross": cross,
-            "twist": twist,
-            "dist":  dist,
-            "lat":   0.0,
-            "lon":   0.0,
-            "speed": 0.0,
-        }
+        # -- GPS ---------------------------------------------------------------
+        self._poll_gps()
 
-    def _adc_to_cross(self, raw):
-        """12-bit BBB ADC -> SCL3300-D01 cross-level degrees.
-        ADC=0->-30deg  |  ADC=2048->0deg  |  ADC=4095->+30deg
-        Offset subtracted from cfg["incl"]["offset"] (calibrated)."""
-        offset = self.cfg["incl"].get("offset", 0.0)
-        return round((raw - self._ADC_MID) / self._ADC_MID * self._INCL_FS - offset, 4)
-
-    # -- simulation ------------------------------------------------------------
-    def _sim(self):
-        import math
-        dist = self._encoder.distance_m()  # use encoder sim even in sensor sim
-        if dist == 0.0:                    # fallback if encoder not yet started
-            self._sim_dist += 0.2
-            dist = round(self._sim_dist, 1)
-        self.motion.emit(True)
-        t     = dist * 0.1
-        gauge = round(self._GAUGE_STD + random.gauss(0, 0.12), 2)
-        cross = round(0.8 * math.sin(t) + random.gauss(0, 0.08), 4)
-        twist = round(max(0.0, abs(cross - self._prev_cross) / self._TWIST_CHORD
-                         + random.gauss(0, 0.01)), 4)
-        self._prev_cross = cross
         return {
             "gauge": gauge,
             "cross": cross,
             "twist": twist,
             "dist":  dist,
-            "lat":   12.9716 + dist * 1e-6,
-            "lon":   77.5946 + dist * 1e-6,
-            "speed": round(random.uniform(2.0, 8.0), 1),
+            "lat":   self._lat,
+            "lon":   self._lon,
+            "speed": self._speed,
         }
+
+    # -- GAUGE read with deadband (no random when pot is still) ----------------
+    def _read_gauge(self):
+        zero = self.cfg["adc"].get("zero", self._ADC_MID)
+        mpc  = self.cfg["adc"].get("mpc",  self._GAUGE_MPC)
+
+        if not HW_SIM:
+            # Real hardware: read ADC sysfs
+            raw = int(_sysfs(ADC_PATH, str(self._last_raw0)))
+        else:
+            # Simulation: pot is at rest -- return last value unchanged
+            # Only update when _sim_move_gauge() is called externally
+            raw = self._last_raw0
+
+        # Apply deadband -- ignore ADC noise smaller than threshold
+        if abs(raw - self._last_raw0) >= self._ADC_DEADBAND or self._last_raw0 == self._ADC_MID:
+            self._last_raw0  = raw
+            # Convert ADC count -> gauge mm (RDSO BG standard)
+            gauge = self._GAUGE_STD + (raw - zero) * mpc
+            # Clamp to physically possible range: 1380..1520 mm
+            gauge = max(1380.0, min(1520.0, gauge))
+            self._last_gauge = round(gauge, 2)
+
+        return self._last_gauge
+
+    # -- CROSS-LEVEL read with deadband ----------------------------------------
+    def _read_cross(self):
+        if not HW_SIM:
+            raw = int(_sysfs(ADC_PATH_1, str(self._last_raw1)))
+        else:
+            raw = self._last_raw1
+
+        if abs(raw - self._last_raw1) >= self._ADC_DEADBAND or self._last_raw1 == self._ADC_MID:
+            self._last_raw1 = raw
+            offset = self.cfg["incl"].get("offset", 0.0)
+            # BBB 12-bit ADC -> SCL3300-D01 cross-level
+            # ADC=0 -> -30 deg | ADC=2048 -> 0 deg | ADC=4095 -> +30 deg
+            cross = (raw - self._ADC_MID) / float(self._ADC_MID) * self._INCL_FS - offset
+            # RDSO cross-level practical range: +/-75 mm over 1500 mm = +/-2.86 deg
+            # SCL3300 full-scale 30 deg -- clamp to sane railway range
+            cross = max(-10.0, min(10.0, cross))
+            self._last_cross = round(cross, 4)
+
+        return self._last_cross
+
+    # -- GPS: read from gpsd if running, else hold last fix --------------------
+    def _poll_gps(self):
+        # Try to read a NMEA GGA sentence from gpsd via gpspipe
+        # Non-blocking: if gpsd not running, silently hold last value
+        try:
+            r = subprocess.run(
+                ["gpspipe", "-r", "-n", "5"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2
+            )
+            for line in r.stdout.decode(errors="replace").splitlines():
+                if "GGA" in line:
+                    parts = line.split(",")
+                    if len(parts) > 9 and parts[2] and parts[4]:
+                        # Parse NMEA lat/lon (DDMM.MMMM format)
+                        lat_raw = parts[2]
+                        lat_dir = parts[3]
+                        lon_raw = parts[4]
+                        lon_dir = parts[5]
+                        fix_q   = int(parts[6]) if parts[6] else 0
+                        if fix_q >= 1:
+                            lat_deg = float(lat_raw[:2])
+                            lat_min = float(lat_raw[2:])
+                            lon_deg = float(lon_raw[:3])
+                            lon_min = float(lon_raw[3:])
+                            self._lat = lat_deg + lat_min / 60.0
+                            self._lon = lon_deg + lon_min / 60.0
+                            if lat_dir == "S":
+                                self._lat = -self._lat
+                            if lon_dir == "W":
+                                self._lon = -self._lon
+                            self._gps_ok = True
+                    break
+                if "RMC" in line:
+                    parts = line.split(",")
+                    if len(parts) > 7 and parts[7]:
+                        try:
+                            self._speed = round(float(parts[7]) * 1.852, 1)  # knots->km/h
+                        except ValueError:
+                            pass
+        except Exception:
+            # gpsd not available -- hold last known fix (lat/lon stay as-is)
+            pass
 
     def reset(self):
         self._prev_cross = 0.0
         self._sim_dist   = 0.0
+        # Reset pots to midpoint (neutral / uncalibrated state)
+        self._last_raw0  = self._ADC_MID
+        self._last_raw1  = self._ADC_MID
+        self._last_gauge = self._GAUGE_STD
+        self._last_cross = 0.0
 
 
 # =============================================================================
