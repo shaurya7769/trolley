@@ -198,6 +198,44 @@ _GPIO_BASE   = "/sys/class/gpio"
 
 SPI_DEV    = "/dev/spidev1.0"
 
+# -- Load required BBB kernel modules at startup -------------------------------
+def _load_kernel_modules():
+    """
+    Load BBB ADC and UART overlay modules silently.
+    These are needed for potentiometers (IIO ADC) and GPS (UART4).
+    Safe to call multiple times -- modprobe is idempotent.
+    """
+    modules = [
+        "ti_am335x_adc",      # BBB IIO ADC (AIN0..AIN6)
+        "omap_hsmmc",         # sometimes needed
+    ]
+    for mod in modules:
+        try:
+            subprocess.call(
+                ["sudo", "modprobe", mod],
+                stdout=open(os.devnull, "w"),
+                stderr=open(os.devnull, "w")
+            )
+        except Exception:
+            pass
+
+    # Enable UART4 for GPS (/dev/ttyS4) via config-pin if available
+    uart4_pins = [("P9.11", "uart"), ("P9.13", "uart")]
+    for pin, mode in uart4_pins:
+        try:
+            subprocess.call(
+                ["config-pin", pin, mode],
+                stdout=open(os.devnull, "w"),
+                stderr=open(os.devnull, "w")
+            )
+        except Exception:
+            pass
+
+_load_kernel_modules()
+
+# Give the kernel 1 second to create /dev and /sys nodes after module load
+time.sleep(1)
+
 # Hardware available when BBB IIO ADC sysfs node is present
 HW_SIM = not os.path.exists(ADC_PATH)
 
@@ -827,10 +865,10 @@ class SensorThread(QThread):
         self._has_adc1 = os.path.exists(ADC_PATH_1)  # incl pot  AIN1
         self._has_gps  = os.path.exists("/dev/ttyS4") # u-blox UART
 
-        # ADC state: initialise to midpoint so gauge shows 1676.0 at startup
-        self._raw0       = self._ADC_MID   # last stable gauge ADC count
-        self._raw1       = self._ADC_MID   # last stable incl  ADC count
-        self._gauge_mm   = self._GAUGE_STD
+        # ADC state: -1 sentinel forces first read to always update display
+        self._raw0       = -1              # gauge pot: -1 = never read yet
+        self._raw1       = -1              # incl pot:  -1 = never read yet
+        self._gauge_mm   = self._GAUGE_STD # shown until first ADC read
         self._cross_mm   = 0.0
 
         # GPS state: hold last valid fix
@@ -884,29 +922,22 @@ class SensorThread(QThread):
     # GAUGE  -- TRS100 pot on AIN0 / P9.39
     # =========================================================================
     def _update_gauge(self):
-        if self._has_adc0:
-            # Real hardware: read BBB IIO sysfs directly
-            try:
-                with open(ADC_PATH, "r") as fh:
-                    raw = int(fh.read().strip())
-            except Exception:
-                return   # keep last good value
-        else:
-            # No ADC hardware -- hold current value, do not simulate
-            return
+        if not self._has_adc0:
+            return   # ADC not available -- hold last value
+        try:
+            with open(ADC_PATH, "r") as fh:
+                raw = int(fh.read().strip())
+        except Exception:
+            return   # sysfs read error -- keep last good value
 
-        # Apply deadband filter
-        if abs(raw - self._raw0) < self._DEADBAND:
-            return   # pot hasn't moved enough -- hold last value
+        # First read: _raw0 starts at -1 sentinel to force first update
+        if self._raw0 >= 0 and abs(raw - self._raw0) < self._DEADBAND:
+            return   # pot hasn't moved beyond noise floor
 
         self._raw0 = raw
-
-        # Use calibrated zero and mpc if available, else class defaults
         zero = self.cfg["adc"].get("zero", self._ADC_MID)
         mpc  = self.cfg["adc"].get("mpc",  self._GAUGE_MPC)
-
         gauge = self._GAUGE_STD + (raw - zero) * mpc
-        # Physical clamp: BG tolerance +/-75 mm around 1676 mm
         gauge = max(1601.0, min(1751.0, gauge))
         self._gauge_mm = round(gauge, 1)
 
@@ -917,20 +948,19 @@ class SensorThread(QThread):
     # ADC=4095 -> +30 deg  -> +523 mm (clamped to +150 mm)
     # =========================================================================
     def _update_cross(self):
-        if self._has_adc1:
-            try:
-                with open(ADC_PATH_1, "r") as fh:
-                    raw = int(fh.read().strip())
-            except Exception:
-                return
-        else:
+        if not self._has_adc1:
+            return
+        try:
+            with open(ADC_PATH_1, "r") as fh:
+                raw = int(fh.read().strip())
+        except Exception:
             return
 
-        if abs(raw - self._raw1) < self._DEADBAND:
+        # First read: _raw1 starts at -1 sentinel to force first update
+        if self._raw1 >= 0 and abs(raw - self._raw1) < self._DEADBAND:
             return
 
         self._raw1 = raw
-
         offset_deg = self.cfg["incl"].get("offset", 0.0)
         angle_deg  = (raw - self._ADC_MID) / float(self._ADC_MID) * self._INCL_FS
         angle_deg -= offset_deg
