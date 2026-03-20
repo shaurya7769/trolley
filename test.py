@@ -865,7 +865,7 @@ class SensorThread(QThread):
     # RDSO 3.5 m chord twist measurement
     _TWIST_CHORD = 3.5
     # ADC noise deadband: 5 counts ~ 0.18 mm (ignores electrical noise)
-    _DEADBAND    = 5
+    _DEADBAND    = 2
     # BBB ADC driver bug: read twice, use second value
     _READ_TWICE  = True
     # GPS mock: track bearing in degrees (approx south-to-north typical IR)
@@ -913,14 +913,10 @@ class SensorThread(QThread):
 
     # ==================================================================
     def run(self):
-        # Re-check hardware after kernel modules have had time to load.
-        # __init__ runs at app start before modprobe completes.
-        # Wait 2 s then re-detect so AIN1 is not missed.
-        self.msleep(2000)
+        # Re-check hardware once on startup -- modules loaded at top of file.
         self._has_adc0 = os.path.exists(ADC_PATH)
         self._has_adc1 = os.path.exists(ADC_PATH_1)
         self._has_gps  = os.path.exists("/dev/ttyS4")
-
         self._open_gps()
 
         while True:
@@ -3312,15 +3308,8 @@ class TrackApp(QWidget):
 
         self.dash.set_csv_label(self.cfg["csv_dir"])
 
-        # -- WINDOW: size to VNC/screen geometry safely ----------------------
-        try:
-            desk   = QApplication.desktop()
-            screen = desk.screenGeometry(desk.primaryScreen())
-            w, h   = screen.width(), screen.height()
-        except Exception:
-            w, h = SCREEN_W, SCREEN_H
-        self.resize(w, h)
-        self.show()
+        # -- WINDOW: maximized on VNC, no crash on missing screen info ---------
+        self.showMaximized()
 
     def _goto(self, idx):
         self.stack.setCurrentIndex(idx)
