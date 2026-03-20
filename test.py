@@ -1212,6 +1212,7 @@ _FIELDS = [
     "epoch_time",
     "reference_type",
     "reference_value",
+    "gauge",
     "latitude",
     "longitude",
     "cross_level",
@@ -1261,13 +1262,14 @@ class CSVLogger:
             "epoch_time":       int(time.time()),
             "reference_type":   self._ref_type,
             "reference_value":  self._ref_value,
+            "gauge":            d.get("gauge", 0),
             "latitude":         d.get("lat",   0),
             "longitude":        d.get("lon",   0),
             "cross_level":      cross,
             "chainage":         d.get("dist",  0),
             "twist":            d.get("twist", 0),
-            "tilt":             cross,              # tilt = inclinometer = cross level
-            "tilt_cord_length": d.get("dist",  0), # cord length tracks with chainage
+            "tilt":             cross,
+            "tilt_cord_length": d.get("dist",  0),
         }
         self._rows.append((time.time(), row))
         self._w.writerow(row)
@@ -2151,14 +2153,7 @@ class InclinCal(QWidget):
         self.cfg     = cfg
         self._offset = None
         self._phase  = "idle"
-
-        # write helper script to /tmp
-        script_src = _SPI_SCRIPT_SRC if os.path.exists(SPI_DEV) else _SPI_SIM_SRC
-        self._script = Path("/tmp/_scl3300_read.py")
-        try:
-            self._script.write_text(script_src)
-        except Exception:
-            pass
+        # No SPI script needed: inclinometer is pot on AIN1, calibrated via ADC
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 10, 14, 10)
@@ -2196,49 +2191,64 @@ class InclinCal(QWidget):
         off = cfg["incl"].get("offset", 0.0)
         self._info = _lbl(
             ("[OK] CALIBRATED" if ok else "[X] NOT CALIBRATED")
-            + "  |  offset={:.5f}deg".format(off),
+            + "  |  offset={:.3f} mm".format(off),
             NEON if ok else RED)
         lay.addWidget(self._info)
         lay.addStretch()
 
-    def _spi_cmd(self):
-        return "echo '# Running SPI reader: {}' && python3 {}".format(self._script, self._script)
+    def _adc1_cmd(self):
+        """Read inclinometer pot raw value from AIN1."""
+        adc1 = "/sys/bus/iio/devices/iio:device0/in_voltage1_raw"
+        if os.path.exists(adc1):
+            return (
+                "echo '# Reading inclinometer pot (AIN1 P9.40)...' && "
+                "cat {p} && echo '' && cat {p}".format(p=adc1)
+            )
+        val = random.randint(1900, 2200)
+        return (
+            "echo '# [SIM] AIN1 not present -- simulation' && "
+            "sleep 0.2 && echo '{}'".format(val)
+        )
 
     def _read_zero(self):
         self._phase = "zero"
-        self._term.run(self._spi_cmd())
+        self._term.run(self._adc1_cmd())
 
     def _verify(self):
         self._phase = "verify"
         self._term.append("\n# Re-reading to verify zero correction...")
-        self._term.run(self._spi_cmd())
+        self._term.run(self._adc1_cmd())
 
     def _on_done(self, code, out):
         if code != 0:
             return
-        angle = None
-        for tok in out.split():
-            if "angle=" in tok:
-                try:
-                    angle = float(tok.split("=")[1]); break
-                except ValueError:
-                    pass
-        if angle is None:
-            self._term.append("[!]  Could not parse angle from output"); return
+        # Parse last integer from output (the raw ADC value)
+        nums = [w.strip() for w in out.split() if w.strip().lstrip("-").isdigit()]
+        if not nums:
+            self._term.append("[!]  Could not parse ADC value"); return
+        raw = int(nums[-1])
+
+        # Convert raw to mm using same piecewise formula as SensorThread
+        ADC_MID = 2048
+        if raw <= ADC_MID:
+            val_mm = (raw / float(ADC_MID)) * 5.0 - 5.0
+        else:
+            val_mm = ((raw - ADC_MID) / 2047.0) * 10.0
 
         if self._phase == "zero":
-            self._offset = angle
-            self._res.setText("Zero offset stored: {:.5f}deg".format(angle))
+            # Store mm value as offset so level track = 0.0mm
+            self._offset = val_mm
+            self._res.setText("Zero offset: raw={} -> {:.3f} mm".format(raw, val_mm))
             self._term.append(
-                ("\n[OK] Zero offset = {:.5f}deg\n"
-                 "  Tap VERIFY to confirm correction is < +/-0.05deg.").format(angle))
+                "[OK] Zero captured: raw={} = {:.3f} mm\n"
+                "  Tap VERIFY to confirm correction.".format(raw, val_mm))
             self._v_btn.setEnabled(True)
         elif self._phase == "verify":
-            corr = angle - (self._offset or 0.0)
-            ok   = abs(corr) < 0.05
+            corr = val_mm - (self._offset or 0.0)
+            ok   = abs(corr) < 0.1
             self._res.setText(
-                "Corrected: {:.4f}deg  ".format(corr)
-                + ("[OK] PASS (<0.05deg)" if ok else "[!]  {:.4f}deg -- re-zero".format(corr)))
+                "Corrected: {:.3f} mm  {}".format(
+                    corr, "[OK] PASS" if ok else "[!] Re-zero needed"))
             self._res.setStyleSheet(
                 "color:{}; font-size:9pt;".format(NEON if ok else AMBER))
 
@@ -2247,7 +2257,7 @@ class InclinCal(QWidget):
             self._term.append("[!]  Read zero first"); return
         self.cfg["incl"].update({"offset": self._offset, "calibrated": True})
         save_cfg(self.cfg)
-        self._info.setText("[OK] CALIBRATED  |  offset={:.5f}deg".format(self._offset))
+        self._info.setText("[OK] CALIBRATED  |  offset={:.3f} mm".format(self._offset))
         self._info.setStyleSheet("color:{}; font-size:9pt;".format(NEON))
         self._term.append("[OK] Saved to rail_config.json")
         self.saved.emit("incl", self.cfg["incl"])
