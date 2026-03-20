@@ -857,11 +857,13 @@ class SensorThread(QThread):
     _GAUGE_MPC   = 0.036621
     _GAUGE_MIN   = 1601.0      # physical minimum (BG -75 mm)
     _GAUGE_MAX   = 1751.0      # physical maximum (BG +75 mm)
-    # SCL3300-D01 Mode-1: +/-30 deg full scale
-    _INCL_FS     = 30.0
-    # 1 deg tilt on 1676 mm base = 17.453 mm cross-level
-    _DEG_TO_MM   = 17.453
-    _CROSS_MAX   = 75.0        # RDSO alarm limit mm (clamp display)
+    # Cross-level pot mapping (piecewise linear, centred at 0mm):
+    #   raw=0    -> -5.0 mm  |  raw=2048 -> 0.0 mm  |  raw=4095 -> +10.0 mm
+    # Field range: Indian Railways BG track typically -5mm to +10mm.
+    # RDSO warn: 50mm, alarm: 75mm (hard outer limits).
+    _CROSS_MAX   = 75.0        # RDSO BG outer hard limit mm
+    _INCL_FS     = 30.0        # kept for calibration reference
+    _DEG_TO_MM   = 17.453      # kept for calibration reference
     # RDSO 3.5 m chord twist measurement
     _TWIST_CHORD = 3.5
     # ADC noise deadband: 5 counts ~ 0.18 mm (ignores electrical noise)
@@ -1017,12 +1019,22 @@ class SensorThread(QThread):
         if self._raw1 >= 0 and abs(raw - self._raw1) < self._DEADBAND:
             return
         self._raw1 = raw
-        offset     = self.cfg["incl"].get("offset", 0.0)
-        angle_deg  = (raw - self._ADC_MID) / float(self._ADC_MID) * self._INCL_FS
-        angle_deg -= offset
-        cross_mm   = angle_deg * self._DEG_TO_MM
-        # RDSO: display and alarm at +/-75 mm; physically clamp at that
-        self._cross_mm = round(max(-self._CROSS_MAX, min(self._CROSS_MAX, cross_mm)), 2)
+        # Piecewise linear mapping -- pot centre = exactly 0.0mm (level track):
+        #   raw=0    -> -5.0 mm  (low side maximum)
+        #   raw=2048 ->  0.0 mm  (level - pot at centre)
+        #   raw=4095 -> +10.0 mm (high side maximum)
+        # This maps the full pot rotation to the realistic Indian Railways
+        # cross-level field measurement range (-5mm to +10mm).
+        # Every count = ~0.005mm resolution -> fully smooth display.
+        offset = self.cfg["incl"].get("offset", 0.0)
+        if raw <= self._ADC_MID:
+            cross_mm = (raw / float(self._ADC_MID)) * 5.0 - 5.0
+        else:
+            cross_mm = ((raw - self._ADC_MID) / 2047.0) * 10.0
+        cross_mm -= offset
+        cross_mm = round(cross_mm, 2)
+        # Hard outer clamp at RDSO BG alarm limit
+        self._cross_mm = max(-self._CROSS_MAX, min(self._CROSS_MAX, cross_mm))
 
     # ==================================================================
     # ADC READ -- BBB IIO sysfs with double-read workaround
@@ -1066,10 +1078,13 @@ class SensorThread(QThread):
 
     def _update_gps(self, dist_m, speed_kmh):
         if self._gps_ser is not None:
-            # Real hardware: read serial buffer
+            # Real GPS hardware: read serial NMEA stream
             self._read_gps_serial()
+            # Also update speed from encoder (GPS speed has latency)
+            self._speed_kmh = speed_kmh
         else:
-            # No GPS hardware: mock lat/lon from chainage
+            # No GPS hardware or pyserial missing: mock from chainage.
+            # Called every tick so lat/lon are always current.
             self._mock_gps(dist_m, speed_kmh)
 
     def _read_gps_serial(self):
@@ -1085,16 +1100,15 @@ class SensorThread(QThread):
 
     def _mock_gps(self, dist_m, speed_kmh):
         """
-        Mock GPS: advances with encoder chainage from a configurable origin.
-        Shows origin coordinates immediately when session starts.
-        Coordinates increment north (or along configured bearing) as trolley moves.
-        This matches real field GPS behaviour where coordinates change with distance.
+        Mock GPS: lat/lon always emitted from first sample.
+        At dist=0 shows origin (survey start point).
+        Advances north as encoder increments.
+        When real GPS hardware is present this method is never called.
         """
         import math as _math
-        bearing_rad = _math.radians(self._GPS_BEARING_DEG)
-        # Project dist_m along bearing from origin
-        d_lat = dist_m * _math.cos(bearing_rad) / self._m_per_deg_lat
-        d_lon = dist_m * _math.sin(bearing_rad) / self._m_per_deg_lon
+        bearing_rad      = _math.radians(self._GPS_BEARING_DEG)
+        d_lat            = dist_m * _math.cos(bearing_rad) / self._m_per_deg_lat
+        d_lon            = dist_m * _math.sin(bearing_rad) / self._m_per_deg_lon
         self._lat        = round(self._origin_lat + d_lat, 7)
         self._lon        = round(self._origin_lon + d_lon, 7)
         self._speed_kmh  = speed_kmh
