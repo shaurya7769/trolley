@@ -896,6 +896,12 @@ class SensorThread(QThread):
         self._last_time  = time.time()
         self._speed_ms   = 0.0
 
+        # Twist: store cross-level history keyed by chainage (m)
+        # Twist = |cross(ch) - cross(ch - CHORD)| / CHORD
+        # Uses a sliding window of (dist, cross_mm) pairs
+        self._cross_history = []   # list of (dist_m, cross_mm) tuples
+        self._last_twist    = 0.0
+
         # GPS state
         self._lat        = 0.0
         self._lon        = 0.0
@@ -950,12 +956,44 @@ class SensorThread(QThread):
         self._update_gauge()
         self._update_cross()
 
-        # Twist: rate of change of cross-level over RDSO 3.5 m chord
-        # Only computed when trolley is moving
-        if moving:
-            twist = round(abs(self._cross_mm - self._prev_cross) / self._TWIST_CHORD, 3)
-        else:
-            twist = 0.0
+        # -- TWIST CALCULATION --------------------------------------------
+        # RDSO method: twist = |cross(ch) - cross(ch-CHORD)| / CHORD
+        # where CHORD = 3.5 m (configured in DataEntryPage).
+        #
+        # Always record (dist, cross) into history every tick.
+        # FIELD mode  (dist > CHORD):
+        #   look back exactly CHORD metres in history -> proper RDSO twist
+        # BENCH mode  (dist <= CHORD, trolley not rolled enough):
+        #   use the FULL history span as the chord denominator
+        #   so twist is always computed and visible during testing
+        self._cross_history.append((dist_m, self._cross_mm))
+        # Trim history beyond 2 * chord to save memory
+        trim = self._TWIST_CHORD * 2.0
+        self._cross_history = [
+            (d, c) for d, c in self._cross_history if dist_m - d <= trim
+        ]
+
+        if len(self._cross_history) >= 2:
+            oldest_dist, oldest_cross = self._cross_history[0]
+            span = dist_m - oldest_dist  # metres between first and last reading
+
+            if span >= self._TWIST_CHORD:
+                # FIELD mode: find reading closest to (dist - CHORD)
+                target = dist_m - self._TWIST_CHORD
+                best   = min(self._cross_history,
+                             key=lambda x: abs(x[0] - target))
+                chord_used = dist_m - best[0]
+                if chord_used > 0.01:
+                    self._last_twist = round(
+                        abs(self._cross_mm - best[1]) / chord_used, 3)
+            elif span > 0.01:
+                # BENCH/SHORT mode: compute over whatever distance we have
+                # Shows meaningful twist during indoor testing
+                self._last_twist = round(
+                    abs(self._cross_mm - oldest_cross) / span, 3)
+            # else span too small -- hold last value
+
+        twist = self._last_twist
         self._prev_cross = self._cross_mm
 
         # GPS: read hardware if present, else mock from chainage
@@ -1159,13 +1197,14 @@ class SensorThread(QThread):
 
     # ==================================================================
     def reset(self):
-        """Session start: reset twist accumulator only.
+        """Session start: reset twist accumulator and history.
         Keep pot positions and GPS fix across session boundaries."""
-        self._prev_cross = 0.0
-        self._last_dist  = 0.0
-        self._last_time  = time.time()
-        self._speed_ms   = 0.0
-        # Reset mock GPS origin to current position if active
+        self._prev_cross    = 0.0
+        self._last_dist     = 0.0
+        self._last_time     = time.time()
+        self._speed_ms      = 0.0
+        self._cross_history = []
+        self._last_twist    = 0.0
         if not self._gps_active:
             self._lat = 0.0
             self._lon = 0.0
@@ -2799,76 +2838,365 @@ class ParamTableWidget(QWidget):
 
 
 class DataEntryPage(QWidget):
+    """
+    LWTMT Field Data Entry -- as required by RDSO para 3.2 / Table 3.3.
+    All fields from the specification are present with appropriate input widgets:
+      - Dropdowns (PresetTiles) for fixed-choice fields
+      - NumpadDialog for numeric fields (chainage, turn-out no., curve no.)
+      - TextPickerDialog for free-text fields (name, designation)
+      - Chord length selector from RDSO standard values
+    Live sensor log auto-captures gauge/cross/twist/chainage during session.
+    """
     sig_back = pyqtSignal()
+    CHORD_OPTIONS = ["3.5", "4.5", "7.0", "9.0", "14.0"]  # RDSO standard chords (m)
 
     def __init__(self):
         super().__init__()
-        self._tables = {}   # key -> ParamTableWidget
+        self._sensor_rows = []
+        self._num_fields  = {}   # key -> current numeric value (float)
+        self._text_btns   = {}   # key -> QPushButton showing current value
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # -- header bar -------------------------------------------------------
+        # header
         hdr_w = QWidget()
         hdr_w.setFixedHeight(50)
         hdr_w.setStyleSheet("background:#070707; border-bottom:1px solid #1a1a1a;")
         hdr = QHBoxLayout(hdr_w)
         hdr.setContentsMargins(10, 0, 10, 0)
-
         back = _btn("<- DASHBOARD", "BC", 40, 170)
         back.clicked.connect(self.sig_back)
-
-        title = QLabel("SURVEY DATA ENTRY")
+        title = QLabel("LWTMT  FIELD DATA ENTRY  (RDSO Para 3.2)")
         title.setStyleSheet(
-            "color:{}; font-size:13pt; font-weight:bold;".format(CYAN))
-
-        clr_btn = _btn("[DEL]  CLEAR ALL", "BR", 40, 150)
-        clr_btn.clicked.connect(self._clear_all)
-
-        sv = _btn("[OK]  SAVE & BACK", "BG", 40, 170)
+            "color:{}; font-size:11pt; font-weight:bold;".format(CYAN))
+        sv = _btn("[OK]  SAVE & BACK", "BG", 40, 160)
         sv.clicked.connect(self.sig_back)
-
         hdr.addWidget(back)
         hdr.addStretch()
         hdr.addWidget(title)
         hdr.addStretch()
-        hdr.addWidget(clr_btn)
-        hdr.addSpacing(8)
         hdr.addWidget(sv)
         root.addWidget(hdr_w)
 
-        # -- scrollable parameter dropdowns -----------------------------------
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea{border:none;}")
         content = QWidget()
         cl = QVBoxLayout(content)
-        cl.setContentsMargins(16, 12, 16, 12)
+        cl.setContentsMargins(14, 10, 14, 14)
         cl.setSpacing(8)
 
-        for key, label, _, freq, unit, color in _PARAM_TABLES:
-            tw = ParamTableWidget(label, color, freq, unit)
-            self._tables[key] = tw
-            cl.addWidget(tw)
+        # ==================================================================
+        # SECTION A -- Station / Location (RDSO 3.2: station code, chainage,
+        #              nomenclature of loop line/siding)
+        # ==================================================================
+        cl.addWidget(_lbl("A.  STATION / LOCATION  (RDSO 3.2)", CYAN, 9, True))
 
+        # Station Code -- text picker with common IR station codes
+        self._add_text_row(cl, "station_code", "Station Code",
+            presets=["NDLS","BCT","MAS","HWH","PUNE","SUR","DD","NGP",
+                     "LKO","CNB","ALD","BSB","CSTM","BRC","ADI","JP"],
+            color=AMBER, hint="e.g. NDLS")
+
+        # Chainage From -- numpad, km format
+        self._add_num_row(cl, "ch_from", "Chainage From (m)",
+            default=0.0, decimals=1, lo=0, hi=9999999, unit="m", color=AMBER)
+
+        # Chainage To -- numpad
+        self._add_num_row(cl, "ch_to", "Chainage To (m)",
+            default=500.0, decimals=1, lo=0, hi=9999999, unit="m", color=AMBER)
+
+        # Hectometer Post -- numpad integer
+        self._add_num_row(cl, "hecto_post", "Hectometer Post",
+            default=0.0, decimals=0, lo=0, hi=9999, unit="hm", color=AMBER)
+
+        # Loop Line / Siding -- preset tiles (fixed choices per IR practice)
+        cl.addLayout(self._tile_row(
+            "loop_line", "Loop / Siding",
+            ["MAIN LINE", "LOOP LINE", "SIDING", "YARD", "RECEPTION",
+             "DEPARTURE"], color=AMBER))
+
+        # ==================================================================
+        # SECTION B -- Track Identity (RDSO 3.2: turn-out no., curve no.)
+        # ==================================================================
+        cl.addSpacing(4)
+        cl.addWidget(_lbl("B.  TRACK IDENTITY", CYAN, 9, True))
+
+        # Turn-out Number -- numpad integer (0 = not applicable)
+        self._add_num_row(cl, "turnout_no", "Turn-out No.",
+            default=0.0, decimals=0, lo=0, hi=9999, unit="", color=NEON,
+            hint="0 = N/A")
+
+        # Curve Number -- numpad integer
+        self._add_num_row(cl, "curve_no", "Curve No.",
+            default=0.0, decimals=0, lo=0, hi=9999, unit="", color=NEON,
+            hint="0 = N/A")
+
+        # Rail Section -- preset tiles
+        cl.addLayout(self._tile_row(
+            "rail_section", "Rail Section",
+            ["60 kg UIC", "52 kg", "90 R", "75 R", "60 R"], color=NEON))
+
+        # Sleeper Type -- preset tiles
+        cl.addLayout(self._tile_row(
+            "sleeper_type", "Sleeper Type",
+            ["PSC MONO", "PSC TWIN", "WOODEN", "STEEL", "CST-9"], color=NEON))
+
+        # ==================================================================
+        # SECTION C -- Personnel (RDSO 3.2: designation of inspecting official)
+        # ==================================================================
+        cl.addSpacing(4)
+        cl.addWidget(_lbl("C.  INSPECTING OFFICIAL", CYAN, 9, True))
+
+        # Inspector Name -- text picker
+        self._add_text_row(cl, "inspector", "Inspector Name",
+            presets=[], color=MAGI, hint="Full name")
+
+        # Designation -- preset tiles (IR standard designations)
+        cl.addLayout(self._tile_row(
+            "designation", "Designation",
+            ["SSE/P-WAY", "JE/P-WAY", "AEN", "DEN", "SEN",
+             "TM/ENGG", "ADEN"], color=MAGI))
+
+        # Division -- preset tiles
+        cl.addLayout(self._tile_row(
+            "division", "Division / Zonal Rly",
+            ["CR", "ER", "ECR", "ECoR", "NCR", "NER", "NFR",
+             "NR", "NWR", "SCR", "SECR", "SER", "SR", "SWR",
+             "WCR", "WR"], color=MAGI))
+
+        # Date of Survey -- text picker
+        self._add_text_row(cl, "survey_date", "Date of Survey",
+            presets=[], color=MAGI,
+            hint=__import__("datetime").datetime.now().strftime("%d-%m-%Y"))
+
+        # ==================================================================
+        # SECTION D -- Measurement Parameters (RDSO 3.2 Table 3.3)
+        # ==================================================================
+        cl.addSpacing(4)
+        cl.addWidget(_lbl("D.  MEASUREMENT PARAMETERS  (RDSO Table 3.3)", CYAN, 9, True))
+
+        # Chord Length -- preset tiles (RDSO standard)
+        chord_row = QHBoxLayout()
+        chord_row.addWidget(_lbl("Twist Chord (m):", "#888", 9))
+        self._chord_tiles = PresetTiles(
+            self.CHORD_OPTIONS, selected="3.5", color=AMBER)
+        chord_row.addWidget(self._chord_tiles, 1)
+        cl.addLayout(chord_row)
+
+        # Reference Chainage (km marker at survey start)
+        ref_row = QHBoxLayout()
+        ref_row.addWidget(_lbl("Ref. Chainage (m):", "#888", 9))
+        self._ref_ch = Stepper(0, step=100, dec=1, lo=0, hi=9999999,
+                               unit="m", title="REF CHAINAGE")
+        ref_row.addWidget(self._ref_ch, 1)
+        cl.addLayout(ref_row)
+
+        # Weather -- preset tiles
+        cl.addLayout(self._tile_row(
+            "weather", "Weather Condition",
+            ["CLEAR", "CLOUDY", "RAIN", "FOG", "HOT", "COLD"], color=AMBER))
+
+        # ==================================================================
+        # SECTION E -- Live Sensor Log (auto-captured, RDSO Table 3.3 values)
+        # ==================================================================
+        cl.addSpacing(4)
+        cl.addWidget(_lbl(
+            "E.  LIVE MEASUREMENT LOG  (auto-captured every 0.5s during session)",
+            CYAN, 9, True))
+
+        # column headers -- matches RDSO Table 3.3 exactly
+        hdr_row = QHBoxLayout()
+        hdr_row.setSpacing(2)
+        cols = [
+            ("CH (m)",   75, MAGI),
+            ("GAUGE mm", 78, NEON),
+            ("X-LVL mm", 78, CYAN),
+            ("TWIST",    72, AMBER),
+            ("LAT",     100, "#666"),
+            ("LON",     100, "#666"),
+        ]
+        for txt, fw, col in cols:
+            lbl = QLabel(txt)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFixedWidth(fw)
+            lbl.setStyleSheet(
+                "color:{}; font-size:7pt; font-weight:bold;"
+                " background:#111; border:1px solid #222;"
+                " padding:3px;".format(col))
+            hdr_row.addWidget(lbl)
+        cl.addLayout(hdr_row)
+
+        self._log_scroll = QScrollArea()
+        self._log_scroll.setWidgetResizable(True)
+        self._log_scroll.setStyleSheet("QScrollArea{border:1px solid #1a1a1a;}")
+        self._log_scroll.setFixedHeight(180)
+        self._log_widget = QWidget()
+        self._log_lay = QVBoxLayout(self._log_widget)
+        self._log_lay.setContentsMargins(0, 0, 0, 0)
+        self._log_lay.setSpacing(1)
+        self._log_lay.addStretch()
+        self._log_scroll.setWidget(self._log_widget)
+        cl.addWidget(self._log_scroll)
+
+        clr_btn = _btn("[DEL]  CLEAR LOG", "BR", 34)
+        clr_btn.clicked.connect(self._clear_log)
+        cl.addWidget(clr_btn)
         cl.addStretch()
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
 
-    def push_sensor_data(self, d):
-        """Called by TrackApp on every sensor tick to add rows to tables."""
-        for key, _, sensor_key, _, _, _ in _PARAM_TABLES:
-            if sensor_key in d and key in self._tables:
-                self._tables[key].push_value(d[sensor_key])
+    # ==================================================================
+    # BUILDER HELPERS
+    # ==================================================================
+    def _make_field_btn(self, hint, color):
+        btn = QPushButton(hint)
+        btn.setFixedHeight(38)
+        btn.setStyleSheet(
+            "QPushButton{{background:#0a0a0a; border:1px solid #2a2a2a;"
+            " border-radius:5px; color:{c}; font-size:9pt;"
+            " font-family:'Courier New'; text-align:left;"
+            " padding-left:10px;}}"
+            "QPushButton:pressed{{background:#111;}}".format(c=color))
+        return btn
 
-    def _clear_all(self):
-        for tw in self._tables.values():
-            tw.clear_rows()
+    def _add_text_row(self, layout, key, label, presets, color, hint="Tap to enter"):
+        row = QHBoxLayout()
+        lw = _lbl(label + ":", "#777", 9)
+        lw.setFixedWidth(180)
+        btn = self._make_field_btn(hint, color)
+        btn.clicked.connect(
+            lambda checked, k=key, b=btn, p=presets:
+                self._open_text(k, b, p))
+        row.addWidget(lw)
+        row.addWidget(btn, 1)
+        layout.addLayout(row)
+        self._text_btns[key] = btn
+
+    def _add_num_row(self, layout, key, label, default, decimals,
+                     lo, hi, unit, color, hint=None):
+        self._num_fields[key] = default
+        row = QHBoxLayout()
+        lw = _lbl(label + ":", "#777", 9)
+        lw.setFixedWidth(180)
+        fmt = "{{:.{}f}}".format(decimals)
+        display = fmt.format(default) + ("  " + unit if unit else "")
+        btn = self._make_field_btn(display if not hint else hint, color)
+        btn.clicked.connect(
+            lambda checked, k=key, b=btn, d=decimals, l=lo, h=hi, u=unit, c=color:
+                self._open_num(k, b, d, l, h, u))
+        row.addWidget(lw)
+        row.addWidget(btn, 1)
+        layout.addLayout(row)
+        self._text_btns[key] = btn
+
+    def _tile_row(self, key, label, options, color):
+        row = QHBoxLayout()
+        lw = _lbl(label + ":", "#777", 9)
+        lw.setFixedWidth(180)
+        tiles = PresetTiles(options, selected=options[0], color=color)
+        row.addWidget(lw)
+        row.addWidget(tiles, 1)
+        self._text_btns[key] = tiles   # tiles have .value()
+        return row
+
+    # ==================================================================
+    # INPUT HANDLERS
+    # ==================================================================
+    def _open_text(self, key, btn, presets):
+        cur = btn.text()
+        dlg = TextPickerDialog(
+            key.replace("_", " ").upper(),
+            presets=presets, current=cur,
+            parent=self.window())
+        if dlg.exec_() == QDialog.Accepted and dlg.get_value():
+            btn.setText(dlg.get_value())
+
+    def _open_num(self, key, btn, decimals, lo, hi, unit):
+        cur = str(self._num_fields.get(key, 0.0))
+        dlg = NumpadDialog(
+            key.replace("_", " ").upper(),
+            current_val=cur, decimals=decimals,
+            min_val=lo, max_val=hi, unit=unit,
+            parent=self.window())
+        if dlg.exec_() == QDialog.Accepted and dlg.get_value() is not None:
+            v = dlg.get_value()
+            self._num_fields[key] = v
+            fmt = "{{:.{}f}}".format(decimals)
+            btn.setText(fmt.format(v) + ("  " + unit if unit else ""))
+
+    # ==================================================================
+    # SENSOR LOG
+    # ==================================================================
+    def push_sensor_data(self, d):
+        ch    = d.get("dist",  0.0)
+        gauge = d.get("gauge", 0.0)
+        cross = d.get("cross", 0.0)
+        twist = d.get("twist", 0.0)
+        lat   = d.get("lat",   0.0)
+        lon   = d.get("lon",   0.0)
+        self._sensor_rows.append((ch, gauge, cross, twist, lat, lon))
+
+        row_w = QWidget()
+        rl = QHBoxLayout(row_w)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(2)
+        cells = [
+            ("{:.2f}".format(ch),    75,  MAGI),
+            ("{:.1f}".format(gauge), 78,  NEON),
+            ("{:.2f}".format(cross), 78,  CYAN),
+            ("{:.3f}".format(twist), 72,  AMBER),
+            ("{:.6f}".format(lat),   100, "#555"),
+            ("{:.6f}".format(lon),   100, "#555"),
+        ]
+        for txt, fw, col in cells:
+            lbl = QLabel(txt)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFixedWidth(fw)
+            lbl.setStyleSheet(
+                "color:{}; font-size:7pt; font-family:'Courier New';"
+                " background:#080808; border:1px solid #161616;"
+                " padding:2px;".format(col))
+            rl.addWidget(lbl)
+        self._log_lay.insertWidget(self._log_lay.count() - 1, row_w)
+        self._log_scroll.verticalScrollBar().setValue(
+            self._log_scroll.verticalScrollBar().maximum())
+
+    def _clear_log(self):
+        self._sensor_rows = []
+        while self._log_lay.count() > 1:
+            item = self._log_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    # ==================================================================
+    def get_chord_m(self):
+        try:
+            return float(self._chord_tiles.value())
+        except Exception:
+            return 3.5
+
+    def get_site_info(self):
+        info = {}
+        for key, widget in self._text_btns.items():
+            if hasattr(widget, "value"):
+                info[key] = widget.value()
+            else:
+                val = widget.text()
+                info[key] = val if val != "Tap to enter" else ""
+        for key, val in self._num_fields.items():
+            info[key] = val
+        info["chord_m"]  = self.get_chord_m()
+        info["ref_ch_m"] = self._ref_ch.value()
+        return info
 
     def get_data(self):
-        """Return dict with all table rows for each parameter."""
-        return {key: tw.get_rows() for key, tw in self._tables.items()}
+        return {
+            "sensor_rows": list(self._sensor_rows),
+            "site_info":   self.get_site_info(),
+        }
 
 
 # =============================================================================
