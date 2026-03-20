@@ -913,7 +913,16 @@ class SensorThread(QThread):
 
     # ==================================================================
     def run(self):
+        # Re-check hardware after kernel modules have had time to load.
+        # __init__ runs at app start before modprobe completes.
+        # Wait 2 s then re-detect so AIN1 is not missed.
+        self.msleep(2000)
+        self._has_adc0 = os.path.exists(ADC_PATH)
+        self._has_adc1 = os.path.exists(ADC_PATH_1)
+        self._has_gps  = os.path.exists("/dev/ttyS4")
+
         self._open_gps()
+
         while True:
             try:
                 d = self._sample()
@@ -1080,22 +1089,19 @@ class SensorThread(QThread):
 
     def _mock_gps(self, dist_m, speed_kmh):
         """
-        Generate GPS coordinates that advance with encoder chainage.
-        Only produces non-zero values once a session is started and
-        the encoder has moved at least 1 metre (field-realistic behaviour).
-        Coordinates advance along a straight bearing from the origin point.
+        Mock GPS: advances with encoder chainage from a configurable origin.
+        Shows origin coordinates immediately when session starts.
+        Coordinates increment north (or along configured bearing) as trolley moves.
+        This matches real field GPS behaviour where coordinates change with distance.
         """
-        if dist_m < 0.001:
-            # No movement yet -- show 0,0 (GPS acquiring)
-            return
         import math as _math
         bearing_rad = _math.radians(self._GPS_BEARING_DEG)
-        # Advance along bearing by dist_m from origin
+        # Project dist_m along bearing from origin
         d_lat = dist_m * _math.cos(bearing_rad) / self._m_per_deg_lat
         d_lon = dist_m * _math.sin(bearing_rad) / self._m_per_deg_lon
-        self._lat       = round(self._origin_lat + d_lat, 7)
-        self._lon       = round(self._origin_lon + d_lon, 7)
-        self._speed_kmh = speed_kmh
+        self._lat        = round(self._origin_lat + d_lat, 7)
+        self._lon        = round(self._origin_lon + d_lon, 7)
+        self._speed_kmh  = speed_kmh
         self._gps_active = True
 
     def _parse_nmea(self, sentence):
@@ -3306,9 +3312,14 @@ class TrackApp(QWidget):
 
         self.dash.set_csv_label(self.cfg["csv_dir"])
 
-        # -- WINDOW: size to actual screen, no forced fullscreen on VNC --------
-        screen = QApplication.desktop().screenGeometry()
-        self.resize(screen.width(), screen.height())
+        # -- WINDOW: size to VNC/screen geometry safely ----------------------
+        try:
+            desk   = QApplication.desktop()
+            screen = desk.screenGeometry(desk.primaryScreen())
+            w, h   = screen.width(), screen.height()
+        except Exception:
+            w, h = SCREEN_W, SCREEN_H
+        self.resize(w, h)
         self.show()
 
     def _goto(self, idx):
