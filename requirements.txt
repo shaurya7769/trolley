@@ -1,0 +1,4 @@
+PyQt5==5.15.10
+spidev==3.6
+pyserial==3.5
+psutil==5.9.8
