@@ -240,26 +240,31 @@ EQEP_PATH = ("/sys/devices/platform/ocp/48304000.epwmss"
 
 
 def _load_kernel_modules():
-    modules = ["ti_am335x_adc", "omap_hsmmc"]
-    for mod in modules:
+    """
+    Load BBB kernel modules silently.
+    NOTE (Debian Trixie 2026): config-pin is REMOVED from this OS.
+    UART4 (/dev/ttyS4) must be enabled via /boot/uEnv.txt at boot.
+    ADC (ti_am335x_adc) is typically auto-loaded or available via modprobe.
+    """
+    for mod in ["ti_am335x_adc", "omap_hsmmc"]:
         try:
             subprocess.call(["sudo", "modprobe", mod],
                             stdout=open(os.devnull, "w"),
                             stderr=open(os.devnull, "w"))
         except Exception:
             pass
-    uart4_pins = [("P9.11", "uart"), ("P9.13", "uart")]
-    for pin, mode in uart4_pins:
-        try:
-            subprocess.call(["config-pin", pin, mode],
-                            stdout=open(os.devnull, "w"),
-                            stderr=open(os.devnull, "w"))
-        except Exception:
-            pass
+    # config-pin is NOT available on Debian Trixie.
+    # UART4 is enabled at boot via /boot/uEnv.txt overlay.
+    # We just check and report -- no runtime pin-mux possible.
+    if not os.path.exists("/dev/ttyS4"):
+        print("[HW] WARNING: /dev/ttyS4 not found -- GPS will be unavailable.")
+        print("[HW] To enable UART4 on Debian Trixie, add to /boot/uEnv.txt:")
+        print("[HW]   uboot_overlay_addr4=/lib/firmware/BB-UART4-00A0.dtbo")
+        print("[HW] Then reboot. (config-pin is deprecated on this OS image)")
 
 
 _load_kernel_modules()
-time.sleep(1)
+time.sleep(0.5)  # reduced from 1s -- modules load fast on Trixie
 
 HW_SIM = not os.path.exists(ADC_PATH)
 
@@ -1046,6 +1051,9 @@ class SensorThread(QThread):
 
         self._update_gps(dist_m, speed_kmh)
 
+        # Use GPS speed if available (serial fix), else encoder-derived speed
+        out_speed = self._speed_kmh if self._gps_active else speed_kmh
+
         return {
             "gauge": self._gauge_mm,
             "cross": self._cross_mm,
@@ -1053,7 +1061,7 @@ class SensorThread(QThread):
             "dist" : round(dist_m, 3),
             "lat"  : self._lat,
             "lon"  : self._lon,
-            "speed": speed_kmh,
+            "speed": round(out_speed, 1),
         }
 
     def _update_gauge(self):
@@ -3506,10 +3514,16 @@ class TrackApp(QWidget):
     def _on_toggle(self, running):
         self.sensor.active = running
         if running:
+            # Pull station code from DataEntry StationParams widget
+            station = (
+                self.entry._station_params._fields.get("Station Code", None)
+            )
+            station_code = (station.value() if station else "") or "BLE"
+
             self.logger.set_reference("", "")
-            self.logger.set_station("BLE")
+            self.logger.set_station(station_code)
             self.csv_writer.set_reference("", "")
-            self.csv_writer.set_station("BLE")
+            self.csv_writer.set_station(station_code)
             self.encoder.reset()
             self.sensor.reset()
             self.history = {k: [] for k in self.history}
