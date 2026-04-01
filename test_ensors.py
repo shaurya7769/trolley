@@ -1,112 +1,116 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BBB Sensor Test - Terminal + CSV
-Fixes applied:
-  1. BBB ADC driver bug: read twice, use second value
-  2. Floating AIN pin detection and clear error messages
-  3. GPS via direct serial with pyserial
-  4. SPI overlay loaded for spidev
-  5. All values only update when pot physically moved (deadband=5)
+bbb_sensor_test.py
+==================
+BeagleBone Black (Debian Trixie 2026)  --  Terminal Live Sensor Test
 
-WIRING (exact - do not deviate):
+Sensors tested:
+  ADC0  (Gauge Pot)    P9.39  AIN0  /sys/bus/iio/devices/iio:device0/in_voltage0_raw
+  ADC1  (Cross Pot)    P9.40  AIN1  /sys/bus/iio/devices/iio:device0/in_voltage1_raw
+  GPIO  (Encoder CLK)  P8.11  GPIO45
+  GPIO  (Encoder DT)   P8.12  GPIO44
+  GPIO  (Encoder SW)   P8.14  GPIO26
+  GPS   (u-blox UART)  P9.11  /dev/ttyS4
 
-  P9 HEADER (left side, from top)
-  P9.1   DGND          Encoder GND, GPS GND
-  P9.3   3.3V          GPS VCC, Encoder VCC
-  P9.4   3.3V          (spare)
-  P9.11  UART4_RX      GPS TX  pin
-  P9.13  UART4_TX      GPS RX  pin (optional)
-  P9.32  VDD_ADC 1.8V  Pot1 Pin1, Pot2 Pin1  <-- MUST BE THIS PIN, NOT P9.3
-  P9.34  GNDA_ADC      Pot1 Pin3, Pot2 Pin3  <-- MUST BE THIS PIN, NOT P9.1
+NOTES for Debian Trixie (2026-03-17 image):
+  - config-pin is GONE. Overlays are loaded in /boot/uEnv.txt at boot time.
+  - ADC overlay (BB-ADC) is loaded by DEFAULT on BBB Trixie images.
+  - UART4: if /dev/ttyS4 is missing, edit /boot/uEnv.txt and add:
+      uboot_overlay_addr4=/lib/firmware/BB-UART4-00A0.dtbo
+    OR for newer kernels that ship the built-in UART4 enabled, it may be
+    available as /dev/ttyS4 already -- this script will tell you.
 
-  P9.39  AIN0          Pot1 Pin2 (wiper) -> GAUGE
-  P9.40  AIN1          Pot2 Pin2 (wiper) -> CROSS-LEVEL
+WIRING (exact -- no deviations):
+  P9.32  VDD_ADC 1.8V  -> Pot(Gauge) Pin1  +  Pot(Cross) Pin1
+  P9.34  GNDA_ADC      -> Pot(Gauge) Pin3  +  Pot(Cross) Pin3
+  P9.39  AIN0          -> Pot(Gauge) wiper (Pin2)
+  P9.40  AIN1          -> Pot(Cross) wiper (Pin2)
+  P9.3   3.3V          -> GPS VCC,  Encoder VCC
+  P9.1   DGND          -> GPS GND,  Encoder GND
+  P9.11  UART4_RX      -> GPS TX pin
+  P8.11  GPIO45        -> Encoder CLK
+  P8.12  GPIO44        -> Encoder DT
+  P8.14  GPIO26        -> Encoder SW (push button)
 
-  P8 HEADER (right side)
-  P8.11  GPIO45        Encoder CLK
-  P8.12  GPIO44        Encoder DT
-  P8.14  GPIO26        Encoder SW
+Run:
+  python3 bbb_sensor_test.py
 
-  POTENTIOMETER (any 10k linear, 3 pins):
-    Pin1 -> P9.32 (1.8V)
-    Pin2 -> P9.39 or P9.40 (wiper = signal)
-    Pin3 -> P9.34 (AGND)
-    When you turn knob fully one way: raw~0, other way: raw~4095
-
-  GPS u-blox NEO-M8P-2:
-    VCC -> P9.3  (3.3V)
-    GND -> P9.1  (DGND)
-    TX  -> P9.11 (UART4_RX on BBB)
+Press Ctrl+C to stop and view per-sensor diagnostic status.
 """
 
-import os, sys, time, csv, subprocess
-from datetime import datetime
+import os
+import sys
+import time
+import subprocess
 
+# ─── Hardware paths ───────────────────────────────────────────────────────────
 ADC0      = "/sys/bus/iio/devices/iio:device0/in_voltage0_raw"
 ADC1      = "/sys/bus/iio/devices/iio:device0/in_voltage1_raw"
 GPIO_BASE = "/sys/class/gpio"
-CLK_GPIO  = 45
-DT_GPIO   = 44
-SW_GPIO   = 26
+CLK_GPIO  = 45   # P8.11
+DT_GPIO   = 44   # P8.12
+SW_GPIO   = 26   # P8.14
 GPS_PORT  = "/dev/ttyS4"
 GPS_BAUD  = 9600
 
-GAUGE_STD = 1676.0
+# ─── Physics constants ────────────────────────────────────────────────────────
+GAUGE_STD = 1676.0          # Indian BG standard gauge mm
+ADC_BITS  = 4096
 ADC_MID   = 2048
-ADC_FULL  = 4096
-GAUGE_MPC = 150.0 / ADC_FULL
-INCL_FS   = 30.0
-DEG_TO_MM = 17.453
-TWIST_M   = 3.5
-DEADBAND  = 5
-PPR       = 20
-WHEEL_MM  = 62.0
+INCL_FS   = 30.0            # Inclinometer full-scale ±deg
+DEG_TO_MM = 17.453          # mm/deg for cross-level (1000mm chord)
+PPR       = 20              # Encoder pulses/revolution
+WHEEL_MM  = 195.0           # Measuring wheel circumference mm (≈62mm dia × π)
+DEADBAND  = 5               # ADC counts to ignore (noise suppressor)
 
 
-def run(cmd):
-    subprocess.call(cmd, stdout=open(os.devnull, "w"),
-                    stderr=open(os.devnull, "w"))
+# ─── Boot-time overlay check (Trixie: no config-pin) ─────────────────────────
+def _run_silent(cmd):
+    try:
+        subprocess.call(cmd,
+                        stdout=open(os.devnull, "w"),
+                        stderr=open(os.devnull, "w"))
+    except Exception:
+        pass
 
 
-def load_hw():
-    # On Debian Trixie: config-pin is REMOVED. Overlays load at boot via uEnv.txt.
-    # Only modprobe calls are safe to make at runtime.
-    run(["sudo", "modprobe", "ti_am335x_adc"])
-    run(["sudo", "modprobe", "spidev"])
+def ensure_adc():
+    """Try to modprobe the ADC kernel module (safe to call multiple times)."""
+    _run_silent(["sudo", "modprobe", "ti_am335x_adc"])
     time.sleep(0.5)
-    # UART4 check -- cannot be fixed at runtime on Trixie
-    if not os.path.exists("/dev/ttyS4"):
-        print("[UART4] /dev/ttyS4 missing. GPS unavailable.")
-        print("[UART4] To fix: add to /boot/uEnv.txt and reboot:")
-        print("[UART4]   uboot_overlay_addr4=/lib/firmware/BB-UART4-00A0.dtbo")
 
 
-def adc_read_twice(path):
+# ─── ADC ──────────────────────────────────────────────────────────────────────
+def adc_read(path):
     """
-    BBB ADC driver bug: first read returns stale value.
-    Read twice, return second value. This is the documented fix.
+    BBB IIO ADC driver workaround:
+    First file-read returns the PREVIOUS (stale) sample.
+    Open and read twice; return only the second value.
     """
+    if not os.path.exists(path):
+        return -1
     try:
         with open(path) as f:
-            f.read()
+            f.read()          # discard stale first read
         with open(path) as f:
             return int(f.read().strip())
     except Exception:
         return -1
 
 
+# ─── GPIO sysfs ───────────────────────────────────────────────────────────────
 def gpio_export(num):
-    val = "{}/gpio{}/value".format(GPIO_BASE, num)
-    if not os.path.exists(val):
+    val_path = "{}/gpio{}/value".format(GPIO_BASE, num)
+    if not os.path.exists(val_path):
         try:
             with open("{}/export".format(GPIO_BASE), "w") as f:
                 f.write(str(num))
-            time.sleep(0.05)
+            time.sleep(0.1)
             with open("{}/gpio{}/direction".format(GPIO_BASE, num), "w") as f:
                 f.write("in")
-        except Exception:
-            pass
+        except Exception as e:
+            print("[GPIO] Cannot export GPIO{}: {}".format(num, e))
 
 
 def gpio_read(num):
@@ -114,110 +118,71 @@ def gpio_read(num):
         with open("{}/gpio{}/value".format(GPIO_BASE, num)) as f:
             return int(f.read().strip())
     except Exception:
-        return 1
+        return 1   # pull-up default = HIGH = not pressed
 
 
-enc_count    = 0
-enc_last_clk = None
+# ─── Rotary Encoder ───────────────────────────────────────────────────────────
+_enc_count   = 0
+_enc_last_clk = None
 
 
-def enc_tick():
-    global enc_count, enc_last_clk
+def encoder_tick():
+    global _enc_count, _enc_last_clk
     clk = gpio_read(CLK_GPIO)
     dt  = gpio_read(DT_GPIO)
-    if enc_last_clk is None:
-        enc_last_clk = clk
+    if _enc_last_clk is None:
+        _enc_last_clk = clk
         return
-    if clk != enc_last_clk:
-        enc_count += 1 if dt != clk else -1
-    enc_last_clk = clk
+    if clk != _enc_last_clk:
+        _enc_count += 1 if (dt != clk) else -1
+    _enc_last_clk = clk
 
 
-def enc_dist():
-    return round(abs(enc_count) / max(1, PPR) * (3.14159265 * WHEEL_MM) / 1000.0, 3)
+def encoder_distance_m():
+    return round(abs(_enc_count) / max(1, PPR) * WHEEL_MM / 1000.0, 4)
 
 
-prev_raw0    = -1
-prev_raw1    = -1
-gauge_stable = GAUGE_STD
-cross_stable = 0.0
+# ─── GPS ──────────────────────────────────────────────────────────────────────
+_gps_ser  = None
+_gps_buf  = ""
+_gps_lat  = 0.0
+_gps_lon  = 0.0
+_gps_spd  = 0.0
+_gps_fix  = 0
+_gps_sats = 0
 
 
-def update_gauge(raw0, zero, mpc):
-    global prev_raw0, gauge_stable
-    if raw0 < 0:
-        return gauge_stable
-    if raw0 < 10:
-        # raw=0 means wiper not connected -- show 0.0 so fault is visible
-        gauge_stable = 0.0
-        prev_raw0 = raw0
-        return gauge_stable
-    if prev_raw0 < 0 or abs(raw0 - prev_raw0) >= DEADBAND:
-        prev_raw0    = raw0
-        g = GAUGE_STD + (raw0 - zero) * mpc
-        gauge_stable = round(max(1601.0, min(1751.0, g)), 1)
-    return gauge_stable
-
-
-def update_cross(raw1, offset):
-    global prev_raw1, cross_stable
-    if raw1 < 0:
-        return cross_stable
-    if raw1 > 4085:
-        # saturated -- Pin1 is at 3.3V instead of 1.8V (P9.32)
-        cross_stable = 999.0
-        prev_raw1 = raw1
-        return cross_stable
-    if prev_raw1 < 0 or abs(raw1 - prev_raw1) >= DEADBAND:
-        prev_raw1    = raw1
-        angle = (raw1 - ADC_MID) / float(ADC_MID) * INCL_FS - offset
-        cross_stable = round(max(-150.0, min(150.0, angle * DEG_TO_MM)), 2)
-    return cross_stable
-
-
-gps_ser  = None
-gps_buf  = ""
-gps_lat  = 0.0
-gps_lon  = 0.0
-gps_spd  = 0.0
-gps_fix  = 0
-gps_sats = 0
-
-
-def open_gps():
-    global gps_ser
+def gps_open():
+    global _gps_ser
     if not os.path.exists(GPS_PORT):
-        print("[GPS] /dev/ttyS4 not found")
-        print("[GPS] Fix: config-pin P9.11 uart  then restart script")
         return
     try:
         import serial
-        gps_ser = serial.Serial(GPS_PORT, GPS_BAUD,
-                                bytesize=8, parity="N",
-                                stopbits=1, timeout=0.1)
-        print("[GPS] Opened /dev/ttyS4 OK")
+        _gps_ser = serial.Serial(GPS_PORT, GPS_BAUD,
+                                 bytesize=8, parity="N",
+                                 stopbits=1, timeout=0.05)
     except ImportError:
-        print("[GPS] pyserial missing -- run: pip3 install pyserial")
+        print("\n[GPS] pyserial not installed -- run:  pip3 install pyserial")
     except Exception as e:
-        print("[GPS] Error opening port: {}".format(e))
+        print("\n[GPS] Cannot open {}: {}".format(GPS_PORT, e))
 
 
-def nmea_deg(s, d):
+def _nmea_to_dec(raw, direction):
     try:
-        s = s.strip()
-        if not s or "." not in s:
+        raw = raw.strip()
+        if not raw or "." not in raw:
             return 0.0
-        i   = s.index(".")
-        deg = float(s[:i - 2])
-        mn  = float(s[i - 2:])
+        i   = raw.index(".")
+        deg = float(raw[:i - 2])
+        mn  = float(raw[i - 2:])
         dec = deg + mn / 60.0
-        return round(-dec if d.upper() in ("S", "W") else dec, 7)
+        return round(-dec if direction.upper() in ("S", "W") else dec, 7)
     except Exception:
         return 0.0
 
 
-def parse_nmea(line):
-    global gps_lat, gps_lon, gps_spd, gps_fix, gps_sats
+def _parse_nmea(line):
+    global _gps_lat, _gps_lon, _gps_spd, _gps_fix, _gps_sats
     try:
         if "*" in line:
             line = line[:line.rindex("*")]
@@ -227,168 +192,273 @@ def parse_nmea(line):
         tag = p[0].upper()
         if "GGA" in tag and len(p) >= 10:
             q = int(p[6]) if p[6].strip().isdigit() else 0
-            gps_fix = q
+            _gps_fix = q
             if q >= 1 and p[2] and p[4]:
-                la = nmea_deg(p[2], p[3])
-                lo = nmea_deg(p[4], p[5])
+                la = _nmea_to_dec(p[2], p[3])
+                lo = _nmea_to_dec(p[4], p[5])
                 if la or lo:
-                    gps_lat, gps_lon = la, lo
+                    _gps_lat = la
+                    _gps_lon = lo
             try:
-                gps_sats = int(p[7]) if p[7].strip().isdigit() else gps_sats
+                _gps_sats = int(p[7]) if p[7].strip().isdigit() else _gps_sats
             except Exception:
                 pass
         elif "RMC" in tag and len(p) >= 8 and p[2].upper() == "A":
             if len(p) > 5 and p[3] and p[5]:
-                la = nmea_deg(p[3], p[4])
-                lo = nmea_deg(p[5], p[6])
+                la = _nmea_to_dec(p[3], p[4])
+                lo = _nmea_to_dec(p[5], p[6])
                 if la or lo:
-                    gps_lat, gps_lon = la, lo
+                    _gps_lat = la
+                    _gps_lon = lo
             if len(p) > 7 and p[7].strip():
-                gps_spd = round(float(p[7]) * 1.852, 1)
+                _gps_spd = round(float(p[7]) * 1.852, 1)
     except Exception:
         pass
 
 
-def poll_gps():
-    global gps_buf
-    if gps_ser is None:
+def gps_poll():
+    global _gps_buf
+    if _gps_ser is None:
         return
     try:
-        n = gps_ser.in_waiting
+        n = _gps_ser.in_waiting
         if n > 0:
-            gps_buf += gps_ser.read(n).decode("ascii", errors="replace")
-            while "\n" in gps_buf:
-                line, gps_buf = gps_buf.split("\n", 1)
-                parse_nmea(line.strip())
+            _gps_buf += _gps_ser.read(n).decode("ascii", errors="replace")
+            while "\n" in _gps_buf:
+                line, _gps_buf = _gps_buf.split("\n", 1)
+                _parse_nmea(line.strip())
     except Exception:
         pass
 
 
-def check_wiring(raw, name, pin):
+# ─── Wiring Diagnostics ───────────────────────────────────────────────────────
+def _adc_status(raw, name, pin):
+    """Return (status_letter, description) for display."""
     if raw < 0:
-        return "ERROR reading {}".format(pin)
+        return "ERR", "{} | {} | NOT FOUND -- check modprobe ti_am335x_adc".format(name, pin)
     if raw < 20:
-        return "WIRING FAULT: {} raw={} -- Pin1 not at 1.8V (P9.32) or wiper disconnected from {}".format(name, raw, pin)
+        return "FAULT", "{} | {} | raw={} -- Disconnected or Pin1 NOT on P9.32 (1.8V)".format(name, pin, raw)
     if raw > 4075:
-        return "WIRING FAULT: {} raw={} -- Using 3.3V instead of 1.8V. Move Pin1 to P9.32".format(name, raw)
-    return "{} raw={} -- OK ({:.0f}%)".format(name, raw, raw / 40.96)
+        return "FAULT", "{} | {} | raw={} -- Saturated: Pin1 is on P9.3 (3.3V), move to P9.32".format(name, pin, raw)
+    pct = int(raw / 40.96)
+    return "OK", "{} | {} | raw={:>4}  {:>3}%  [{:<20}]".format(
+        name, pin, raw, pct, "=" * (pct // 5))
 
 
+def _gpio_status(pin_num, name, pin_label, last_val):
+    try:
+        v = gpio_read(pin_num)
+        return "OK", "{} | {} | gpio{}  val={}".format(name, pin_label, pin_num, v)
+    except Exception as e:
+        return "FAULT", "{} | {} | gpio{}  ERROR: {}".format(name, pin_label, pin_num, e)
+
+
+def _gps_status():
+    if not os.path.exists(GPS_PORT):
+        return "MISS", "GPS  | /dev/ttyS4 | PORT NOT FOUND -- UART4 overlay not loaded"
+    if _gps_ser is None:
+        return "ERR", "GPS  | /dev/ttyS4 | Port found but failed to open (pyserial?)"
+    if _gps_fix == 0:
+        return "WAIT", "GPS  | /dev/ttyS4 | Port open, NO FIX yet -- take outdoors & wait 60s"
+    return "OK", "GPS  | /dev/ttyS4 | FIX={} | sats={} | {:.7f},{:.7f} | {:.1f}km/h".format(
+        _gps_fix, _gps_sats, _gps_lat, _gps_lon, _gps_spd)
+
+
+STATUS_COLOR = {
+    "OK":    "\033[92m",  # green
+    "WAIT":  "\033[93m",  # yellow
+    "FAULT": "\033[91m",  # red
+    "ERR":   "\033[91m",  # red
+    "MISS":  "\033[91m",  # red
+}
+RESET = "\033[0m"
+BOLD  = "\033[1m"
+
+
+def print_status_block(final=False):
+    r0  = adc_read(ADC0)
+    r1  = adc_read(ADC1)
+    enc_ok = os.path.exists("{}/gpio{}/value".format(GPIO_BASE, CLK_GPIO))
+
+    rows = []
+    for raw, name, pin in [(r0, "ADC0-GAUGE", "P9.39"),
+                            (r1, "ADC1-CROSS", "P9.40")]:
+        st, msg = _adc_status(raw, name, pin)
+        rows.append((st, msg))
+
+    for gnum, name, plbl in [(CLK_GPIO, "ENC-CLK", "P8.11"),
+                              (DT_GPIO,  "ENC-DT ", "P8.12"),
+                              (SW_GPIO,  "ENC-SW ", "P8.14")]:
+        st = "OK" if os.path.exists("{}/gpio{}/value".format(GPIO_BASE, gnum)) else "ERR"
+        val = gpio_read(gnum) if st == "OK" else "?"
+        msg = "{} | {} | gpio{}  val={}".format(name, plbl, gnum, val)
+        rows.append((st, msg))
+
+    gst, gmsg = _gps_status()
+    rows.append((gst, gmsg))
+
+    title = "FINAL STATUS AFTER Ctrl+C" if final else "HARDWARE STATUS CHECK"
+    print("\n" + BOLD + "=" * 74 + RESET)
+    print(BOLD + " " + title + RESET)
+    print(BOLD + "=" * 74 + RESET)
+    for st, msg in rows:
+        col = STATUS_COLOR.get(st, "")
+        print("  {}[{:<5}]{} {}".format(col, st, RESET, msg))
+    print(BOLD + "=" * 74 + RESET + "\n")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print("Loading hardware modules (ADC, SPI, UART4)...")
-    load_hw()
+    print(BOLD + "\n===  BBB SENSOR LIVE TEST  (Debian Trixie)  ===" + RESET)
+    print("Loading ADC kernel module (modprobe ti_am335x_adc)...")
+    ensure_adc()
 
+    # GPIO export
     for g in (CLK_GPIO, DT_GPIO, SW_GPIO):
         gpio_export(g)
 
-    has0 = os.path.exists(ADC0)
-    has1 = os.path.exists(ADC1)
+    # Check ADC presence
+    has_adc0 = os.path.exists(ADC0)
+    has_adc1 = os.path.exists(ADC1)
 
     print()
-    print("HARDWARE CHECK")
-    print("  AIN0 (gauge)  : {}".format("OK" if has0 else "MISSING -- sudo modprobe ti_am335x_adc"))
-    print("  AIN1 (cross)  : {}".format("OK" if has1 else "MISSING -- same module needed"))
-    print("  GPS /dev/ttyS4: {}".format("OK" if os.path.exists(GPS_PORT) else "MISSING -- config-pin P9.11 uart"))
-    print("  SPI /dev/spi  : {}".format("OK" if os.path.exists("/dev/spidev1.0") else "MISSING (not critical for pots)"))
+    print(" ADC0 (Gauge, P9.39) : " +
+          ("\033[92mFOUND\033[0m" if has_adc0 else "\033[91mMISSING\033[0m -- sudo modprobe ti_am335x_adc"))
+    print(" ADC1 (Cross, P9.40) : " +
+          ("\033[92mFOUND\033[0m" if has_adc1 else "\033[91mMISSING\033[0m -- same module needed"))
+    print(" GPS  (/dev/ttyS4)   : " +
+          ("\033[92mFOUND\033[0m" if os.path.exists(GPS_PORT)
+           else "\033[91mMISSING\033[0m -- UART4 overlay not loaded (see /boot/uEnv.txt)"))
     print()
 
-    if not has0:
-        print("CRITICAL: ADC not found. Cannot read potentiometers.")
-        print("Run: sudo modprobe ti_am335x_adc")
+    # Open GPS
+    gps_open()
+
+    # Initial wiring check
+    print_status_block(final=False)
+
+    if not has_adc0:
+        print("\033[91m" + "CRITICAL: ADC not found. Cannot read potentiometers." + "\033[0m")
+        print("On Debian Trixie with built-in overlays the ADC should auto-load.")
+        print("Try:  sudo modprobe ti_am335x_adc")
+        print("If still missing, add to /boot/uEnv.txt:")
+        print("  uboot_overlay_addr4=/lib/firmware/BB-ADC-00A0.dtbo")
+        print("Then reboot and retry.\n")
         sys.exit(1)
 
-    r0_start = adc_read_twice(ADC0) if has0 else -1
-    r1_start = adc_read_twice(ADC1) if has1 else -1
-    print(check_wiring(r0_start, "AIN0 GAUGE",  "P9.39"))
-    print(check_wiring(r1_start, "AIN1 CROSS",  "P9.40"))
-    print()
+    # ── Column header ────────────────────────────────────────────────────────
+    HDR = (
+        " {:<8} | {:<4} {:<4} {:<10} | "
+        "{:<4} {:<4} {:<10} | "
+        "{:<5} {:<9} {:<3} | "
+        "{:<3} {:<5} | {}"
+    ).format(
+        "TIME",
+        "RAW0", "RAW1", "  (ADC vals)",
+        "CLK", "DT", "ENCPULSES",
+        "DIST", "GAUGE(mm)", "CROSS",
+        "FIX", "SPD",
+        "STATUS"
+    )
+    print(BOLD + HDR + RESET)
+    print("-" * len(HDR))
 
-    open_gps()
-
-    cfg_zero   = ADC_MID
-    cfg_mpc    = GAUGE_MPC
-    cfg_offset = 0.0
-    if os.path.exists("rail_config.json"):
-        try:
-            import json
-            c = json.load(open("rail_config.json"))
-            cfg_zero   = c.get("adc",  {}).get("zero",   ADC_MID)
-            cfg_mpc    = c.get("adc",  {}).get("mpc",    GAUGE_MPC)
-            cfg_offset = c.get("incl", {}).get("offset", 0.0)
-            print("[CFG] Loaded calibration: zero={} mpc={:.5f} offset={:.3f}".format(
-                  cfg_zero, cfg_mpc, cfg_offset))
-        except Exception:
-            pass
-
-    fname = "sensor_log_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M%S"))
-    fout  = open(fname, "w", newline="")
-    wcsv  = csv.writer(fout)
-    wcsv.writerow(["timestamp",
-                   "gauge_mm", "adc0_raw",
-                   "cross_mm", "adc1_raw",
-                   "twist_mm_per_m", "distance_m", "enc_count",
-                   "lat", "lon", "speed_kmh", "gps_fix", "gps_sats"])
-    print("Logging to: {}".format(fname))
-    print("Ctrl+C to stop")
-    print()
-
-    HDR = ("{:<13} {:>9} {:>6}  {:>10} {:>6}  {:>7} {:>8}  "
-           "{:>11} {:>11} {:>5}  GPS").format(
-          "TIME", "GAUGE mm", "ADC0", "CROSS mm", "ADC1",
-          "TWIST", "DIST m", "LAT", "LON", "SPD")
-    print(HDR)
-    print("-" * 118)
-
-    prev_cross = 0.0
-    rows       = 0
+    _prev_r0 = -1
+    _prev_r1 = -1
+    _gauge_mm  = 1676.0
+    _cross_mm  = 0.0
 
     try:
         while True:
-            for _ in range(50):
-                enc_tick()
-                time.sleep(0.01)
+            # Poll encoder rapidly (20 times × 10ms = 200ms effective polling)
+            for _ in range(20):
+                encoder_tick()
+                time.sleep(0.010)
 
-            r0    = adc_read_twice(ADC0) if has0 else -1
-            r1    = adc_read_twice(ADC1) if has1 else -1
-            gauge = update_gauge(r0, cfg_zero, cfg_mpc)
-            cross = update_cross(r1, cfg_offset)
-            twist = round(abs(cross - prev_cross) / TWIST_M, 3)
-            prev_cross = cross
-            dist  = enc_dist()
-            poll_gps()
+            # ADC reads
+            r0 = adc_read(ADC0) if has_adc0 else -1
+            r1 = adc_read(ADC1) if has_adc1 else -1
 
-            now   = datetime.now().strftime("%H:%M:%S.%f")[:13]
-            gstat = "FIX{} {}sat".format(gps_fix, gps_sats) if gps_fix > 0 else "NO FIX"
+            # Gauge mm (only update if past deadband)
+            if r0 >= 0 and (_prev_r0 < 0 or abs(r0 - _prev_r0) >= DEADBAND):
+                _prev_r0  = r0
+                raw_gauge = 1676.0 + (r0 - ADC_MID) * (150.0 / ADC_BITS)
+                _gauge_mm = round(max(1601.0, min(1751.0, raw_gauge)), 1)
 
-            g_disp = "DISCONNECTED" if gauge == 0.0    else "{:.1f}".format(gauge)
-            c_disp = "3.3V-ERROR"   if cross == 999.0   else "{:.2f}".format(cross)
-            print("{:<13} {:>13} {:>6}  {:>13} {:>6}  {:>7.3f} {:>8.3f}  "
-                  "{:>11.6f} {:>11.6f} {:>5.1f}  {}".format(
-                  now, g_disp, r0, c_disp, r1,
-                  twist, dist, gps_lat, gps_lon, gps_spd, gstat))
+            # Cross-level mm (piecewise, matching integrated_rail.py)
+            if r1 >= 0 and (_prev_r1 < 0 or abs(r1 - _prev_r1) >= DEADBAND):
+                _prev_r1 = r1
+                if r1 <= ADC_MID:
+                    _cross_mm = round((r1 / float(ADC_MID)) * 5.0 - 5.0, 2)
+                else:
+                    _cross_mm = round(((r1 - ADC_MID) / 2047.0) * 10.0, 2)
+                _cross_mm = max(-75.0, min(75.0, _cross_mm))
 
-            wcsv.writerow([datetime.now().isoformat(),
-                           gauge, r0, cross, r1,
-                           twist, dist, enc_count,
-                           gps_lat, gps_lon, gps_spd, gps_fix, gps_sats])
-            fout.flush()
-            rows += 1
+            gps_poll()
+            dist = encoder_distance_m()
+
+            # Format time
+            now_t = time.strftime("%H:%M:%S")
+
+            # Fault flags
+            g_disp = "DISCONN" if (r0 < 20) else "{:.1f}".format(_gauge_mm)
+            c_disp = "3.3V-ERR" if (r1 > 4075) else "{:.2f}".format(_cross_mm)
+
+            # GPS status
+            if not os.path.exists(GPS_PORT):
+                gps_disp = "NO PORT"
+            elif _gps_fix > 0:
+                gps_disp = "FIX{} {}s".format(_gps_fix, _gps_sats)
+            else:
+                gps_disp = "NO FIX"
+
+            clk_v = gpio_read(CLK_GPIO)
+            dt_v  = gpio_read(DT_GPIO)
+
+            line = (
+                " {:<8} | {:<4} {:<4}              | "
+                "{:<4} {:<4} {:<10} | "
+                "{:<5.3f} {:<9} {:<8} | "
+                "{:<3} {:.1f}km/h| {}"
+            ).format(
+                now_t,
+                r0 if r0 >= 0 else "ERR",
+                r1 if r1 >= 0 else "ERR",
+                clk_v, dt_v, _enc_count,
+                dist, g_disp, c_disp,
+                _gps_fix, _gps_spd,
+                gps_disp,
+            )
+
+            # Overwrite the same line in terminal
+            sys.stdout.write("\r" + line)
+            sys.stdout.flush()
 
     except KeyboardInterrupt:
-        fout.close()
-        print()
-        print("Stopped. {} rows -> {}".format(rows, fname))
-        print()
-        print("FINAL WIRING DIAGNOSIS:")
-        print(check_wiring(adc_read_twice(ADC0) if has0 else -1, "AIN0", "P9.39"))
-        print(check_wiring(adc_read_twice(ADC1) if has1 else -1, "AIN1", "P9.40"))
-        if gps_ser is None:
-            print("GPS: not connected or pyserial missing (pip3 install pyserial)")
-        elif gps_fix == 0:
-            print("GPS: port open but no fix -- take unit outside, wait 60 seconds")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        print_status_block(final=True)
+
+        # GPS detail
+        if _gps_ser is None and not os.path.exists(GPS_PORT):
+            print("\033[91m[UART4 FIX]\033[0m /dev/ttyS4 not found.")
+            print("  The Debian Trixie image may need an overlay in /boot/uEnv.txt.")
+            print("  Check what overlays are available:")
+            print("    ls /lib/firmware/ | grep UART")
+            print("  Then add to /boot/uEnv.txt:")
+            print("    uboot_overlay_addr4=/lib/firmware/<UART4-OVERLAY>.dtbo")
+            print("  Reboot and re-run this script.\n")
+        elif _gps_fix == 0:
+            print("\033[93m[GPS WAIT]\033[0m Port open but no fix.")
+            print("  - Move the unit outdoors with clear sky view.")
+            print("  - Wait up to 90 seconds for cold-start acquisition.")
+            print("  - Verify wiring: GPS TX -> P9.11, VCC->P9.3, GND->P9.1\n")
         else:
-            print("GPS: fix={} sats={} lat={} lon={}".format(
-                  gps_fix, gps_sats, gps_lat, gps_lon))
+            print("\033[92m[GPS OK]\033[0m fix={} sats={} lat={} lon={}".format(
+                _gps_fix, _gps_sats, _gps_lat, _gps_lon))
+
+        print("Encoder final count: {}  distance: {:.4f} m\n".format(
+            _enc_count, encoder_distance_m()))
 
 
 if __name__ == "__main__":
